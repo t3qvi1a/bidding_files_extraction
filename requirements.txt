@@ -1,0 +1,9 @@
+# PDF reader
+pypdf>=5.0,<7.0
+
+# Local Chinese OCR; models are downloaded on first use.
+paddleocr>=3.0,<4.0
+paddlepaddle>=3.0,<4.0
+
+# Image dependency
+Pillow>=10.0
