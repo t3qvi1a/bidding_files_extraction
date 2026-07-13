@@ -22,12 +22,23 @@ class FakePDFTextEngine:
     :CreateTime: 2026-07-13 11:08:59
     """
 
-    def __init__(self, pdf_path: Path, cache_dir: Path, config: ProcessingConfig) -> None:
+    received_ocr_backends: list[object | None] = []
+
+    def __init__(
+        self,
+        pdf_path: Path,
+        cache_dir: Path,
+        config: ProcessingConfig,
+        ocr_backend: object | None = None,
+        progress_callback: object | None = None,
+    ) -> None:
         """
         【方法功能】保存测试参数并初始化单页状态。
         :param pdf_path: Path+测试 PDF 路径
         :param cache_dir: Path+测试缓存路径
         :param config: ProcessingConfig+测试处理配置
+        :param ocr_backend: object|None+共享 OCR 后端占位参数
+        :param progress_callback: object|None+OCR 进度回调占位参数
         :return: None
         :Author: gexinyan
         :CreateTime: 2026-07-13 11:08:59
@@ -35,6 +46,9 @@ class FakePDFTextEngine:
         self.pdf_path = pdf_path
         self.cache_dir = cache_dir
         self.config = config
+        self.ocr_backend = ocr_backend
+        self.progress_callback = progress_callback
+        type(self).received_ocr_backends.append(ocr_backend)
         self.page_count = 1
         self.ocr_pages = {1}
 
@@ -143,6 +157,31 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(summary.files[0].category, "bid_announcement")
             self.assertTrue(any("处理中 1/1" in message for message in messages))
             self.assertTrue(any("完成 1/1" in message for message in messages))
+
+    def test_process_tree_reuses_one_ocr_backend_for_all_files(self) -> None:
+        """
+        【方法功能】验证同一批 PDF 处理时向每个文件引擎传入同一个 OCR 后端实例。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-13 16:45:00
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "pdf_files" / "bid_announcement"
+            input_dir.mkdir(parents=True)
+            (input_dir / "announcement_01.pdf").write_bytes(b"fake-pdf")
+            (input_dir / "announcement_02.pdf").write_bytes(b"fake-pdf")
+            shared_backend = object()
+            FakePDFTextEngine.received_ocr_backends = []
+            with patch("bidding_ocr.pipeline.PDFTextEngine", FakePDFTextEngine):
+                summary = process_pdf_tree(
+                    root / "pdf_files",
+                    root / "results",
+                    ocr_backend=shared_backend,
+                )
+
+            self.assertEqual(summary.total_files, 2)
+            self.assertEqual(FakePDFTextEngine.received_ocr_backends, [shared_backend, shared_backend])
 
 
 if __name__ == "__main__":

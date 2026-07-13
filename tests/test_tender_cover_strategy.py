@@ -289,9 +289,16 @@ class TenderCoverStrategyTests(unittest.TestCase):
         self.assertEqual(red_channel[0, 0].tolist(), [220, 220, 220])
         self.assertEqual(red_channel[0, 1].tolist(), [20, 20, 20])
         self.assertEqual(len(build_cover_image_variants(image)), 2)
-        self.assertTrue(
-            any(name == "company_crop_red_channel" for name, _ in build_cover_image_variants(image, True))
-        )
+        retry_names = [
+            name
+            for name, _ in build_cover_image_variants(
+                image,
+                include_top_crop=True,
+                retry_only=True,
+            )
+        ]
+        self.assertEqual(len(retry_names), 3)
+        self.assertIn("company_crop_red_channel", retry_names)
 
     def test_multi_strategy_prefers_seal_removed_result_and_caches_it(self) -> None:
         """
@@ -341,9 +348,14 @@ class TenderCoverStrategyTests(unittest.TestCase):
                 ProcessingConfig(dpi=150),
                 CompanyCandidateOCRBackend(),
             )
+            messages: list[str] = []
+            engine.progress_callback = messages.append
             page = engine.get_tender_cover_page(1, 150)
             fields = extract_tender_cover_fields(page.text, prefer_title=True)
             self.assertEqual(fields.company_name, "江苏仪征苏中建设有限公司")
+            self.assertTrue(any("基础候选 1/2" in message for message in messages))
+            self.assertTrue(any("高分辨率定向候选 1/3" in message for message in messages))
+            self.assertTrue(any("候选 5 个" in message for message in messages))
 
     def test_malformed_plain_company_suffix_triggers_retry(self) -> None:
         """

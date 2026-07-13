@@ -21,7 +21,7 @@ from bidding_ocr.models import (
     ProcessSummary,
 )
 from bidding_ocr.parsers import ParserContext, parse_document
-from bidding_ocr.pdf_engine import PDFTextEngine
+from bidding_ocr.pdf_engine import OCRBackend, PDFTextEngine, PaddleOCRBackend
 from bidding_ocr.utils import classify_pdf, compact_for_match, normalize_text
 
 
@@ -67,6 +67,7 @@ def process_pdf_tree(
     config: ProcessingConfig | None = None,
     category_filter: str | None = None,
     progress_callback: ProgressCallback | None = None,
+    ocr_backend: OCRBackend | None = None,
 ) -> ProcessSummary:
     """
     【函数功能】统一处理输入目录中的全部 PDF，输出分类、合并及复核结果。
@@ -75,6 +76,7 @@ def process_pdf_tree(
     :param config: ProcessingConfig|None+可选处理配置
     :param category_filter: str|None+可选标准类别，仅处理该类别 PDF（默认处理全部）
     :param progress_callback: ProgressCallback|None+可选运行进度消息回调（默认不输出）
+    :param ocr_backend: OCRBackend|None+可选共享 OCR 后端（默认本次运行创建一个 PaddleOCR 后端）
     :return: ProcessSummary+本次运行统计
     :raises FileNotFoundError: 输入目录不存在时触发
     :Author: gexinyan
@@ -88,6 +90,7 @@ def process_pdf_tree(
     if category_filter is not None and category_filter not in CATEGORIES:
         raise ValueError(f"不支持的 PDF 类别：{category_filter}")
     actual_config = config or ProcessingConfig()
+    shared_ocr_backend = ocr_backend or PaddleOCRBackend()
     output_path.mkdir(parents=True, exist_ok=True)
     cache_dir = output_path / ".ocr_cache"
     started_at = current_timestamp()
@@ -134,6 +137,11 @@ def process_pdf_tree(
                 input_path,
                 cache_dir,
                 actual_config,
+                ocr_backend=shared_ocr_backend,
+                progress_callback=lambda message: _emit_progress(
+                    progress_callback,
+                    f"文件：{relative_path} | {message}",
+                ),
             )
             all_records.extend(document.records)
             review_count = sum(record.review_status != "通过" for record in document.records)
@@ -247,6 +255,8 @@ def process_single_pdf(
     input_root: Path,
     cache_dir: Path,
     config: ProcessingConfig,
+    ocr_backend: OCRBackend | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[ParsedDocument, list[str]]:
     """
     【函数功能】分类、提取页面并解析单个 PDF 文件。
@@ -254,13 +264,15 @@ def process_single_pdf(
     :param input_root: Path+输入根目录
     :param cache_dir: Path+OCR 缓存目录
     :param config: ProcessingConfig+处理配置
+    :param ocr_backend: OCRBackend|None+可选共享 OCR 后端
+    :param progress_callback: ProgressCallback|None+可选 OCR 阶段进度消息回调
     :return: tuple[ParsedDocument, list[str]]+解析文档与页面告警列表
     :raises ValueError: 文件无法分类或未能读取任何页面时触发
     :Author: gexinyan
     :CreateTime: 2026-07-13 11:08:59
     Example: process_single_pdf(path, root, cache, config)
     """
-    engine = PDFTextEngine(pdf_path, cache_dir, config)
+    engine = PDFTextEngine(pdf_path, cache_dir, config, ocr_backend, progress_callback)
     first_native = engine.native_text(1) if engine.page_count else ""
     category = classify_pdf(pdf_path, input_root, engine.page_count, first_native)
     warnings: list[str] = []

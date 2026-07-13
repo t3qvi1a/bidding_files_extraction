@@ -9,9 +9,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from PIL import Image
@@ -39,6 +40,8 @@ from bidding_ocr.utils import is_readable_chinese_text
 
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+ProgressCallback = Callable[[str], None]
 
 
 class OCRBackend(ABC):
@@ -241,6 +244,7 @@ class PDFTextEngine:
         cache_dir: Path,
         config: ProcessingConfig,
         ocr_backend: OCRBackend | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         """
         【方法功能】打开 PDF 并初始化 OCR 后端和缓存路径。
@@ -248,6 +252,7 @@ class PDFTextEngine:
         :param cache_dir: Path+OCR 缓存根目录
         :param config: ProcessingConfig+处理配置
         :param ocr_backend: OCRBackend|None+可注入的 OCR 后端（默认PaddleOCR）
+        :param progress_callback: ProgressCallback|None+可选 OCR 进度消息回调（默认不输出）
         :return: None
         :Author: gexinyan
         :CreateTime: 2026-07-13 11:08:59
@@ -256,6 +261,7 @@ class PDFTextEngine:
         self.cache_dir = cache_dir
         self.config = config
         self.ocr_backend = ocr_backend or PaddleOCRBackend()
+        self.progress_callback = progress_callback
         if PdfReader is not None:
             self.reader = PdfReader(str(pdf_path), strict=False)
             self._reader_kind = "pypdf"
@@ -406,9 +412,11 @@ class PDFTextEngine:
         cache_profile = "tender-cover-v4"
         cached = self._read_cache(page_number, actual_dpi, cache_profile)
         if cached is not None and not self.config.force_ocr:
+            self._emit_progress(f"封面 OCR：第{page_number}页命中缓存，跳过候选识别。")
             self.ocr_pages.add(page_number)
             return cached
 
+        started_at = time.perf_counter()
         self.ocr_backend.prepare()
         candidates: list[tuple[list[OCRLine], float]] = []
         errors: list[str] = []
@@ -423,6 +431,8 @@ class PDFTextEngine:
                     temp_path,
                     f"page-{page_number}-{actual_dpi}",
                     include_top_crop=False,
+                    retry_only=False,
+                    stage_name="基础候选",
                     errors=errors,
                 )
             )
@@ -431,6 +441,9 @@ class PDFTextEngine:
             best_average = self._average_line_confidence(best_lines)
             if is_fragmented_cover_text(best_text, best_average):
                 retry_dpi = max(actual_dpi + 50, round(actual_dpi * 1.25))
+                self._emit_progress(
+                    f"封面 OCR：基础候选质量不足，启动 {retry_dpi} DPI 定向重试（3 个候选）。"
+                )
                 retry_path = temp_path / f"page-{page_number}-{retry_dpi}.png"
                 self._render_page(page_number, retry_dpi, retry_path)
                 retry_image = np.asarray(Image.open(retry_path).convert("RGB"))
@@ -440,6 +453,8 @@ class PDFTextEngine:
                         temp_path,
                         f"page-{page_number}-{retry_dpi}",
                         include_top_crop=True,
+                        retry_only=True,
+                        stage_name="高分辨率定向候选",
                         errors=errors,
                     )
                 )
@@ -458,6 +473,10 @@ class PDFTextEngine:
         )
         self._write_cache(page, cache_profile)
         self.ocr_pages.add(page_number)
+        self._emit_progress(
+            f"封面 OCR：第{page_number}页完成，候选 {len(candidates)} 个，总耗时 "
+            f"{time.perf_counter() - started_at:.1f} 秒。"
+        )
         return page
 
     def _recognize_cover_variants(
@@ -466,6 +485,8 @@ class PDFTextEngine:
         temp_dir: Path,
         prefix: str,
         include_top_crop: bool,
+        retry_only: bool,
+        stage_name: str,
         errors: list[str],
     ) -> list[tuple[list[OCRLine], float]]:
         """
@@ -474,24 +495,51 @@ class PDFTextEngine:
         :param temp_dir: Path+候选图片临时目录
         :param prefix: str+候选图片稳定前缀
         :param include_top_crop: bool+是否加入顶部裁剪候选
+        :param retry_only: bool+是否只保留高分辨率定向裁剪候选
+        :param stage_name: str+当前候选阶段名称
         :param errors: list[str]+用于收集候选失败信息的列表
         :return: list[tuple[list[OCRLine], float]]+成功候选及质量分
         :Author: gexinyan
         :CreateTime: 2026-07-13 14:20:13
         """
         candidates: list[tuple[list[OCRLine], float]] = []
-        for variant_name, variant_image in build_cover_image_variants(image, include_top_crop):
+        variants = build_cover_image_variants(image, include_top_crop, retry_only)
+        for variant_index, (variant_name, variant_image) in enumerate(variants, start=1):
             variant_path = temp_dir / f"{prefix}-{variant_name}.png"
             Image.fromarray(np.asarray(variant_image, dtype=np.uint8)).save(variant_path)
+            self._emit_progress(
+                f"封面 OCR：{stage_name} {variant_index}/{len(variants)}（{variant_name}）开始。"
+            )
+            started_at = time.perf_counter()
             try:
                 lines = self.ocr_backend.recognize(variant_path)
             except Exception as exc:
                 errors.append(f"{variant_name}:{type(exc).__name__}:{exc}")
+                self._emit_progress(
+                    f"封面 OCR：{stage_name} {variant_index}/{len(variants)}（{variant_name}）失败，"
+                    f"耗时 {time.perf_counter() - started_at:.1f} 秒。"
+                )
                 continue
             text = "\n".join(line.text for line in lines)
             average_score = self._average_line_confidence(lines)
             candidates.append((lines, score_cover_ocr_text(text, average_score)))
+            self._emit_progress(
+                f"封面 OCR：{stage_name} {variant_index}/{len(variants)}（{variant_name}）完成，"
+                f"耗时 {time.perf_counter() - started_at:.1f} 秒，识别 {len(lines)} 行。"
+            )
         return candidates
+
+    def _emit_progress(self, message: str) -> None:
+        """
+        【方法功能】向调用方发送一条 OCR 阶段进度消息。
+        :param message: str+待发送的中文进度消息
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-13 16:45:00
+        Example: self._emit_progress("封面 OCR：基础候选 1/2 开始。")
+        """
+        if self.progress_callback is not None:
+            self.progress_callback(message)
 
     @staticmethod
     def _merge_cover_company_candidate(

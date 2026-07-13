@@ -190,31 +190,48 @@ def crop_company_name_image(
     return image[top:bottom, left:right, :]
 
 
-def build_cover_image_variants(image: Any, include_top_crop: bool = False) -> list[tuple[str, Any]]:
+def build_cover_image_variants(
+    image: Any,
+    include_top_crop: bool = False,
+    retry_only: bool = False,
+) -> list[tuple[str, Any]]:
     """
-    【函数功能】生成原图、去红章图及可选顶部裁剪图，自动跳过完全相同的候选。
+    【函数功能】生成封面 OCR 候选图，重试时仅保留定向裁剪候选以减少重复识别。
     :param image: Any+RGB 图像数组
-    :param include_top_crop: bool+是否加入顶部裁剪候选（默认False）
+    :param include_top_crop: bool+是否加入标题、底部和企业区域裁剪候选（默认False）
+    :param retry_only: bool+是否只生成高分辨率定向重试候选（默认False）
     :return: list[tuple[str, Any]]+候选名称与图像数组
     :Author: gexinyan
     :CreateTime: 2026-07-13 14:20:13
     Example: build_cover_image_variants(image, True)
     """
-    candidates: list[tuple[str, Any]] = [("original", image)]
-    seal_removed = remove_red_seal(image)
-    if not np.array_equal(image, seal_removed):
-        candidates.append(("remove_red_seal", seal_removed))
+    candidates: list[tuple[str, Any]] = []
+    if not retry_only:
+        candidates.append(("original", image))
+        seal_removed = remove_red_seal(image)
+        if not np.array_equal(image, seal_removed):
+            candidates.append(("remove_red_seal", seal_removed))
     if include_top_crop:
         top_image = crop_top_image(image)
-        candidates.append(("top_crop", top_image))
         top_without_seal = remove_red_seal(top_image)
-        if not np.array_equal(top_image, top_without_seal):
-            candidates.append(("top_crop_remove_red_seal", top_without_seal))
+        candidates.append(
+            (
+                "top_crop_remove_red_seal" if not np.array_equal(top_image, top_without_seal) else "top_crop",
+                top_without_seal if not np.array_equal(top_image, top_without_seal) else top_image,
+            )
+        )
         bottom_image = crop_bottom_image(image)
-        candidates.append(("bottom_crop", bottom_image))
         bottom_without_seal = remove_red_seal(bottom_image)
-        if not np.array_equal(bottom_image, bottom_without_seal):
-            candidates.append(("bottom_crop_remove_red_seal", bottom_without_seal))
+        candidates.append(
+            (
+                (
+                    "bottom_crop_remove_red_seal"
+                    if not np.array_equal(bottom_image, bottom_without_seal)
+                    else "bottom_crop"
+                ),
+                bottom_without_seal if not np.array_equal(bottom_image, bottom_without_seal) else bottom_image,
+            )
+        )
         company_image = crop_company_name_image(image)
         candidates.append(
             (
