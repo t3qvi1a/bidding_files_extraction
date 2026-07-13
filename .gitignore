@@ -1,5 +1,7 @@
 pdf_files/
+results/
 results/.ocr_cache/
 __pycache__/
 *.py[cod]
 .venv/
+.paddlex_cache/

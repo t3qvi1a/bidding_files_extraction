@@ -13,7 +13,15 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from pypdf import PdfReader
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None  # type: ignore[assignment,misc]
+
+try:
+    import pypdfium2 as pdfium
+except ImportError:
+    pdfium = None
 
 from bidding_ocr.models import OCRLine, PageText, ProcessingConfig
 from bidding_ocr.utils import is_readable_chinese_text
@@ -76,6 +84,9 @@ class PaddleOCRBackend(OCRBackend):
         """
         if self._engine is not None:
             return self._engine
+        project_root = Path(__file__).resolve().parents[1]
+        os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(project_root / ".paddlex_cache"))
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
         try:
             from paddleocr import PaddleOCR
         except ImportError as exc:
@@ -85,12 +96,12 @@ class PaddleOCRBackend(OCRBackend):
         try:
             self._engine = PaddleOCR(
                 lang="ch",
-                use_doc_orientation_classify=True,
+                use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
-                use_textline_orientation=True,
+                use_textline_orientation=False,
             )
         except (TypeError, ValueError):
-            self._engine = PaddleOCR(lang="ch", use_angle_cls=True, show_log=False)
+            self._engine = PaddleOCR(lang="ch", use_angle_cls=False, show_log=False)
         return self._engine
 
     def recognize(self, image_path: Path) -> list[OCRLine]:
@@ -232,7 +243,14 @@ class PDFTextEngine:
         self.cache_dir = cache_dir
         self.config = config
         self.ocr_backend = ocr_backend or PaddleOCRBackend()
-        self.reader = PdfReader(str(pdf_path), strict=False)
+        if PdfReader is not None:
+            self.reader = PdfReader(str(pdf_path), strict=False)
+            self._reader_kind = "pypdf"
+        elif pdfium is not None:
+            self.reader = pdfium.PdfDocument(str(pdf_path))
+            self._reader_kind = "pdfium"
+        else:
+            raise RuntimeError("缺少 PDF 读取依赖，请安装 pypdf 或 pypdfium2。")
         self._file_hash: str | None = None
         self.ocr_pages: set[int] = set()
 
@@ -244,7 +262,7 @@ class PDFTextEngine:
         :Author: gexinyan
         :CreateTime: 2026-07-13 11:08:59
         """
-        return len(self.reader.pages)
+        return len(self.reader.pages) if self._reader_kind == "pypdf" else len(self.reader)
 
     def native_text(self, page_number: int) -> str:
         """
@@ -255,7 +273,11 @@ class PDFTextEngine:
         :CreateTime: 2026-07-13 11:08:59
         """
         try:
-            return self.reader.pages[page_number - 1].extract_text() or ""
+            if self._reader_kind == "pypdf":
+                return self.reader.pages[page_number - 1].extract_text() or ""
+            page = self.reader[page_number - 1]
+            text_page = page.get_textpage()
+            return text_page.get_text_range() or ""
         except Exception:
             return ""
 
@@ -267,6 +289,19 @@ class PDFTextEngine:
         :CreateTime: 2026-07-13 11:08:59
         """
         pages: list[int] = []
+
+        if self._reader_kind == "pdfium":
+            try:
+                for bookmark in self.reader.get_toc():
+                    if "封面" not in bookmark.get_title():
+                        continue
+                    destination = bookmark.get_dest()
+                    page = destination.get_index() + 1 if destination else 0
+                    if 1 <= page <= self.page_count and page not in pages:
+                        pages.append(page)
+            except Exception:
+                return []
+            return sorted(pages)
 
         def walk(items: Any) -> None:
             """

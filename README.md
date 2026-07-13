@@ -12,6 +12,23 @@
 python -m pip install -r requirements.txt
 ```
 
+推荐使用 Python 3.10 的独立 Conda 环境：
+
+```powershell
+conda env create -f environment.yml
+conda run -n bidding-ocr python main.py --input pdf_files --output results
+```
+
+如果本机已有 `screen-parser-mvp` Conda 环境，可直接复用其中的 PaddleOCR 3.7.0、PaddlePaddle 3.3.1 和缓存模型，无需重新下载：
+
+```powershell
+conda run -n screen-parser-mvp python main.py --input pdf_files --output results
+```
+
+代码会优先使用 `pypdf`，环境未安装该包时自动回退到 `pypdfium2`。
+
+PaddleX 模型默认缓存到当前项目的 `.paddlex_cache`，避免 Windows 沙箱或账户权限导致无法读取用户目录下的 `~/.paddlex`。首次使用仍需下载检测和识别模型。
+
 ## 运行
 
 ```powershell
