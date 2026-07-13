@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from bidding_ocr.models import (
     CATEGORIES,
@@ -47,6 +47,8 @@ SOURCE_PRIORITY = {
     "unknown": 1,
 }
 
+ProgressCallback = Callable[[str], None]
+
 
 def current_timestamp() -> str:
     """
@@ -63,12 +65,16 @@ def process_pdf_tree(
     input_dir: Path | str,
     output_dir: Path | str,
     config: ProcessingConfig | None = None,
+    category_filter: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> ProcessSummary:
     """
     【函数功能】统一处理输入目录中的全部 PDF，输出分类、合并及复核结果。
     :param input_dir: Path|str+PDF 输入目录
     :param output_dir: Path|str+CSV 和运行摘要输出目录
     :param config: ProcessingConfig|None+可选处理配置
+    :param category_filter: str|None+可选标准类别，仅处理该类别 PDF（默认处理全部）
+    :param progress_callback: ProgressCallback|None+可选运行进度消息回调（默认不输出）
     :return: ProcessSummary+本次运行统计
     :raises FileNotFoundError: 输入目录不存在时触发
     :Author: gexinyan
@@ -79,15 +85,49 @@ def process_pdf_tree(
     output_path = Path(output_dir).resolve()
     if not input_path.is_dir():
         raise FileNotFoundError(f"PDF 输入目录不存在：{input_path}")
+    if category_filter is not None and category_filter not in CATEGORIES:
+        raise ValueError(f"不支持的 PDF 类别：{category_filter}")
     actual_config = config or ProcessingConfig()
     output_path.mkdir(parents=True, exist_ok=True)
     cache_dir = output_path / ".ocr_cache"
     started_at = current_timestamp()
     all_records: list[ExtractionRecord] = []
     file_summaries: list[FileProcessSummary] = []
+    all_pdf_paths = sorted(input_path.rglob("*.pdf"), key=lambda path: str(path).lower())
+    planned_categories = {
+        pdf_path: classify_pdf(pdf_path, input_path, page_count=0)
+        for pdf_path in all_pdf_paths
+    }
+    pdf_paths = [
+        pdf_path
+        for pdf_path in all_pdf_paths
+        if category_filter is None or planned_categories[pdf_path] == category_filter
+    ]
+    category_totals: dict[str, int] = defaultdict(int)
+    for pdf_path in pdf_paths:
+        category_totals[planned_categories[pdf_path]] += 1
+    category_positions: dict[str, int] = defaultdict(int)
+    total_files = len(pdf_paths)
+    _emit_progress(
+        progress_callback,
+        f"发现 {total_files} 个待处理 PDF"
+        + (f"，类别筛选：{category_filter}" if category_filter else "，开始解析。"),
+    )
 
-    for pdf_path in sorted(input_path.rglob("*.pdf"), key=lambda path: str(path).lower()):
+    for file_index, pdf_path in enumerate(pdf_paths, start=1):
         relative_path = str(pdf_path.relative_to(input_path))
+        planned_category = planned_categories[pdf_path]
+        category_positions[planned_category] += 1
+        category_index = category_positions[planned_category]
+        category_total = category_totals[planned_category]
+        _emit_progress(
+            progress_callback,
+            (
+                f"{_format_progress_bar(file_index - 1, total_files)} "
+                f"处理中 {file_index}/{total_files} | 类别 {planned_category} "
+                f"{category_index}/{category_total} | 文件：{relative_path}"
+            ),
+        )
         try:
             document, warnings = process_single_pdf(
                 pdf_path,
@@ -98,17 +138,25 @@ def process_pdf_tree(
             all_records.extend(document.records)
             review_count = sum(record.review_status != "通过" for record in document.records)
             status = "待复核" if review_count or warnings else "成功"
-            file_summaries.append(
-                FileProcessSummary(
-                    path=relative_path,
-                    category=document.category,
-                    pages=document.page_count,
-                    ocr_pages=sorted(document.ocr_pages),
-                    records=len(document.records),
-                    review_records=review_count,
-                    status=status,
-                    error="；".join(warnings),
-                )
+            file_summary = FileProcessSummary(
+                path=relative_path,
+                category=document.category,
+                pages=document.page_count,
+                ocr_pages=sorted(document.ocr_pages),
+                records=len(document.records),
+                review_records=review_count,
+                status=status,
+                error="；".join(warnings),
+            )
+            file_summaries.append(file_summary)
+            _emit_progress(
+                progress_callback,
+                (
+                    f"{_format_progress_bar(file_index, total_files)} "
+                    f"完成 {file_index}/{total_files} | 类别 {file_summary.category} "
+                    f"| 页数 {file_summary.pages} | OCR 页 {file_summary.ocr_pages or '无'} "
+                    f"| 记录 {file_summary.records} | 状态 {file_summary.status}"
+                ),
             )
         except Exception as exc:
             failed_record = ExtractionRecord(
@@ -119,19 +167,27 @@ def process_pdf_tree(
                 generated_at=current_timestamp(),
             )
             all_records.append(failed_record)
-            file_summaries.append(
-                FileProcessSummary(
-                    path=relative_path,
-                    category="unknown",
-                    pages=0,
-                    ocr_pages=[],
-                    records=1,
-                    review_records=1,
-                    status="失败",
-                    error=str(exc),
-                )
+            file_summary = FileProcessSummary(
+                path=relative_path,
+                category="unknown",
+                pages=0,
+                ocr_pages=[],
+                records=1,
+                review_records=1,
+                status="失败",
+                error=str(exc),
+            )
+            file_summaries.append(file_summary)
+            _emit_progress(
+                progress_callback,
+                (
+                    f"{_format_progress_bar(file_index, total_files)} "
+                    f"完成 {file_index}/{total_files} | 类别 {planned_category} "
+                    f"| 文件解析失败：{relative_path} | 原因：{exc}"
+                ),
             )
 
+    _emit_progress(progress_callback, "PDF 解析完成，正在生成分类 CSV、最终汇总和复核清单。")
     _write_category_csv_files(all_records, output_path)
     final_records = merge_and_deduplicate(all_records)
     write_records_csv(output_path / "final.csv", final_records)
@@ -149,7 +205,41 @@ def process_pdf_tree(
         json.dumps(summary.to_dict(), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _emit_progress(progress_callback, f"结果已写入：{output_path}")
     return summary
+
+
+def _emit_progress(callback: ProgressCallback | None, message: str) -> None:
+    """
+    【函数功能】在存在回调时发送一条可即时显示的运行进度消息。
+    :param callback: ProgressCallback|None+进度消息接收函数
+    :param message: str+待发送的中文进度消息
+    :return: None
+    :Author: gexinyan
+    :CreateTime: 2026-07-13 16:25:00
+    Example: _emit_progress(print, "完成 1/10")
+    """
+    if callback is not None:
+        callback(message)
+
+
+def _format_progress_bar(completed: int, total: int, width: int = 20) -> str:
+    """
+    【函数功能】按已完成文件数生成无第三方依赖的终端文本进度条。
+    :param completed: int+已完成文件数
+    :param total: int+总文件数
+    :param width: int+进度条字符宽度（默认20）
+    :return: str+形如 [##########----------] 5/10 (50%) 的进度条
+    :Author: gexinyan
+    :CreateTime: 2026-07-13 16:25:00
+    Example: _format_progress_bar(5, 10)
+    """
+    if total <= 0:
+        return "[--------------------] 0/0 (0%)"
+    bounded_completed = min(max(completed, 0), total)
+    ratio = bounded_completed / total
+    filled = round(ratio * width)
+    return f"[{'#' * filled}{'-' * (width - filled)}] {bounded_completed}/{total} ({ratio:.0%})"
 
 
 def process_single_pdf(
@@ -213,11 +303,38 @@ def load_pages_for_category(
     """
     if category == "archive_info":
         return _load_archive_pages(engine, config)
-    if category == "tender_cover" and engine.page_count > 3:
-        page_numbers = engine.cover_bookmark_pages() or list(range(1, min(5, engine.page_count) + 1))
-    else:
-        page_numbers = list(range(1, engine.page_count + 1))
+    if category == "tender_cover":
+        if engine.page_count > 3:
+            page_numbers = engine.cover_bookmark_pages() or list(range(1, min(5, engine.page_count) + 1))
+        else:
+            page_numbers = [1] if engine.page_count else []
+        return _load_tender_cover_pages(engine, page_numbers, config.dpi)
+    page_numbers = list(range(1, engine.page_count + 1))
     return _load_selected_pages(engine, page_numbers, config.dpi)
+
+
+def _load_tender_cover_pages(
+    engine: PDFTextEngine,
+    page_numbers: Iterable[int],
+    dpi: int,
+) -> tuple[list[PageText], list[str]]:
+    """
+    【函数功能】仅为投标封面页启用原图、去红章与低质量重试的多策略 OCR。
+    :param engine: PDFTextEngine+PDF 文本与 OCR 引擎
+    :param page_numbers: Iterable[int]+封面候选页码
+    :param dpi: int+基础 OCR 分辨率
+    :return: tuple[list[PageText], list[str]]+成功页面及页级告警
+    :Author: gexinyan
+    :CreateTime: 2026-07-13 14:20:13
+    """
+    pages: list[PageText] = []
+    warnings: list[str] = []
+    for page_number in sorted(set(page_numbers)):
+        try:
+            pages.append(engine.get_tender_cover_page(page_number, dpi))
+        except Exception as exc:
+            warnings.append(f"第{page_number}页封面多策略提取失败：{exc}")
+    return pages, warnings
 
 
 def _load_selected_pages(

@@ -115,6 +115,35 @@ class PipelineIntegrationTests(unittest.TestCase):
             run_summary = json.loads((output_dir / "run_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(run_summary["文件总数"], 1)
 
+    def test_category_filter_emits_file_progress(self) -> None:
+        """
+        【方法功能】验证类别筛选仅处理目标目录文件，并输出开始和完成进度消息。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-13 16:25:00
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            announcement_dir = root / "pdf_files" / "bid_announcement"
+            notice_dir = root / "pdf_files" / "award_notice"
+            announcement_dir.mkdir(parents=True)
+            notice_dir.mkdir(parents=True)
+            (announcement_dir / "announcement.pdf").write_bytes(b"fake-pdf")
+            (notice_dir / "notice.pdf").write_bytes(b"fake-pdf")
+            messages: list[str] = []
+            with patch("bidding_ocr.pipeline.PDFTextEngine", FakePDFTextEngine):
+                summary = process_pdf_tree(
+                    root / "pdf_files",
+                    root / "results",
+                    category_filter="bid_announcement",
+                    progress_callback=messages.append,
+                )
+
+            self.assertEqual(summary.total_files, 1)
+            self.assertEqual(summary.files[0].category, "bid_announcement")
+            self.assertTrue(any("处理中 1/1" in message for message in messages))
+            self.assertTrue(any("完成 1/1" in message for message in messages))
+
 
 if __name__ == "__main__":
     unittest.main()

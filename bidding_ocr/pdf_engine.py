@@ -13,6 +13,9 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from PIL import Image
+
 try:
     from pypdf import PdfReader
 except ImportError:
@@ -24,6 +27,14 @@ except ImportError:
     pdfium = None
 
 from bidding_ocr.models import OCRLine, PageText, ProcessingConfig
+from bidding_ocr.tender_cover_strategy import (
+    build_cover_image_variants,
+    cover_text_needs_ocr,
+    extract_company_name_candidate,
+    is_fragmented_cover_text,
+    score_company_name_candidate,
+    score_cover_ocr_text,
+)
 from bidding_ocr.utils import is_readable_chinese_text
 
 
@@ -87,6 +98,8 @@ class PaddleOCRBackend(OCRBackend):
         project_root = Path(__file__).resolve().parents[1]
         os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(project_root / ".paddlex_cache"))
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+        os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
+        os.environ.setdefault("FLAGS_use_mkldnn", "0")
         try:
             from paddleocr import PaddleOCR
         except ImportError as exc:
@@ -371,6 +384,167 @@ class PDFTextEngine:
         self.ocr_pages.add(page_number)
         return page
 
+    def get_tender_cover_page(self, page_number: int, dpi: int | None = None) -> PageText:
+        """
+        【方法功能】为投标封面执行原图、去红章和低质量重试的多策略 OCR。
+        :param page_number: int+从1开始的页码
+        :param dpi: int|None+基础 OCR 分辨率（默认使用配置高精度分辨率）
+        :return: PageText+质量评分最高的封面页面文字
+        :raises ValueError: 页码超出范围时触发
+        :raises RuntimeError: 所有封面 OCR 候选均失败时触发
+        :Author: gexinyan
+        :CreateTime: 2026-07-13 14:20:13
+        """
+        if page_number < 1 or page_number > self.page_count:
+            raise ValueError(f"页码超出范围：{page_number}/{self.page_count}")
+        native = self.native_text(page_number)
+        if not cover_text_needs_ocr(native):
+            lines = [OCRLine(line.strip(), 1.0, []) for line in native.splitlines() if line.strip()]
+            return PageText(page_number, "\n".join(line.text for line in lines), lines, "text", 0)
+
+        actual_dpi = dpi or self.config.dpi
+        cache_profile = "tender-cover-v4"
+        cached = self._read_cache(page_number, actual_dpi, cache_profile)
+        if cached is not None and not self.config.force_ocr:
+            self.ocr_pages.add(page_number)
+            return cached
+
+        self.ocr_backend.prepare()
+        candidates: list[tuple[list[OCRLine], float]] = []
+        errors: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="bidding_cover_ocr_") as temp_dir:
+            temp_path = Path(temp_dir)
+            image_path = temp_path / f"page-{page_number}-{actual_dpi}.png"
+            self._render_page(page_number, actual_dpi, image_path)
+            image = np.asarray(Image.open(image_path).convert("RGB"))
+            candidates.extend(
+                self._recognize_cover_variants(
+                    image,
+                    temp_path,
+                    f"page-{page_number}-{actual_dpi}",
+                    include_top_crop=False,
+                    errors=errors,
+                )
+            )
+            best_lines, best_score = max(candidates, key=lambda item: item[1], default=([], -1.0))
+            best_text = "\n".join(line.text for line in best_lines)
+            best_average = self._average_line_confidence(best_lines)
+            if is_fragmented_cover_text(best_text, best_average):
+                retry_dpi = max(actual_dpi + 50, round(actual_dpi * 1.25))
+                retry_path = temp_path / f"page-{page_number}-{retry_dpi}.png"
+                self._render_page(page_number, retry_dpi, retry_path)
+                retry_image = np.asarray(Image.open(retry_path).convert("RGB"))
+                candidates.extend(
+                    self._recognize_cover_variants(
+                        retry_image,
+                        temp_path,
+                        f"page-{page_number}-{retry_dpi}",
+                        include_top_crop=True,
+                        errors=errors,
+                    )
+                )
+                best_lines, best_score = max(candidates, key=lambda item: item[1], default=([], -1.0))
+
+        if not best_lines:
+            error_message = "；".join(errors) if errors else "OCR 未返回文字"
+            raise RuntimeError(f"投标封面多策略 OCR 失败：{error_message}")
+        best_lines = self._merge_cover_company_candidate(best_lines, candidates)
+        page = PageText(
+            page_number=page_number,
+            text="\n".join(line.text for line in best_lines),
+            lines=best_lines,
+            method="ocr",
+            dpi=actual_dpi,
+        )
+        self._write_cache(page, cache_profile)
+        self.ocr_pages.add(page_number)
+        return page
+
+    def _recognize_cover_variants(
+        self,
+        image: Any,
+        temp_dir: Path,
+        prefix: str,
+        include_top_crop: bool,
+        errors: list[str],
+    ) -> list[tuple[list[OCRLine], float]]:
+        """
+        【方法功能】保存并识别一组封面图像候选，返回文字行和封面质量分。
+        :param image: Any+RGB 图像数组
+        :param temp_dir: Path+候选图片临时目录
+        :param prefix: str+候选图片稳定前缀
+        :param include_top_crop: bool+是否加入顶部裁剪候选
+        :param errors: list[str]+用于收集候选失败信息的列表
+        :return: list[tuple[list[OCRLine], float]]+成功候选及质量分
+        :Author: gexinyan
+        :CreateTime: 2026-07-13 14:20:13
+        """
+        candidates: list[tuple[list[OCRLine], float]] = []
+        for variant_name, variant_image in build_cover_image_variants(image, include_top_crop):
+            variant_path = temp_dir / f"{prefix}-{variant_name}.png"
+            Image.fromarray(np.asarray(variant_image, dtype=np.uint8)).save(variant_path)
+            try:
+                lines = self.ocr_backend.recognize(variant_path)
+            except Exception as exc:
+                errors.append(f"{variant_name}:{type(exc).__name__}:{exc}")
+                continue
+            text = "\n".join(line.text for line in lines)
+            average_score = self._average_line_confidence(lines)
+            candidates.append((lines, score_cover_ocr_text(text, average_score)))
+        return candidates
+
+    @staticmethod
+    def _merge_cover_company_candidate(
+        best_lines: list[OCRLine],
+        candidates: list[tuple[list[OCRLine], float]],
+    ) -> list[OCRLine]:
+        """
+        【函数功能】从局部裁剪候选补充最佳全文候选缺失的投标人企业名称。
+        :param best_lines: list[OCRLine]+质量分最高的全文文字行
+        :param candidates: list[tuple[list[OCRLine], float]]+全部成功 OCR 候选
+        :return: list[OCRLine]+必要时追加企业字段的文字行
+        :Author: gexinyan
+        :CreateTime: 2026-07-13 14:20:13
+        """
+        company_candidates: dict[str, tuple[float, float, int]] = {}
+        for lines, _ in candidates:
+            for line in lines:
+                company_name = extract_company_name_candidate(line.text)
+                if not company_name:
+                    continue
+                current_score, current_confidence, count = company_candidates.get(
+                    company_name,
+                    (0.0, 0.0, 0),
+                )
+                candidate_score = score_company_name_candidate(company_name, line.confidence)
+                company_candidates[company_name] = (
+                    max(current_score, candidate_score),
+                    max(current_confidence, line.confidence),
+                    count + 1,
+                )
+        if not company_candidates:
+            return best_lines
+        company_name, (_, confidence, _) = max(
+            company_candidates.items(),
+            key=lambda item: (item[1][0], item[1][2], item[1][1]),
+        )
+        current_company = extract_company_name_candidate("\n".join(line.text for line in best_lines))
+        if company_name == current_company:
+            return best_lines
+        return [OCRLine(f"投标人：{company_name}", confidence, []), *best_lines]
+
+    @staticmethod
+    def _average_line_confidence(lines: list[OCRLine]) -> float:
+        """
+        【函数功能】计算非空 OCR 文字行的平均置信度。
+        :param lines: list[OCRLine]+OCR 文字行
+        :return: float+平均置信度，无文字时返回0
+        :Author: gexinyan
+        :CreateTime: 2026-07-13 14:20:13
+        """
+        scores = [line.confidence for line in lines if line.text.strip()]
+        return sum(scores) / len(scores) if scores else 0.0
+
     def _render_page(self, page_number: int, dpi: int, output_path: Path) -> None:
         """
         【方法功能】使用 Poppler 将指定 PDF 页面渲染为 PNG。
@@ -417,27 +591,30 @@ class PDFTextEngine:
             self._file_hash = digest.hexdigest()
         return self._file_hash
 
-    def _cache_path(self, page_number: int, dpi: int) -> Path:
+    def _cache_path(self, page_number: int, dpi: int, profile: str = "default") -> Path:
         """
         【方法功能】生成指定文件、页码和分辨率对应的 OCR 缓存路径。
         :param page_number: int+页码
         :param dpi: int+OCR 分辨率
+        :param profile: str+OCR 策略缓存标识（默认default）
         :return: Path+JSON 缓存文件路径
         :Author: gexinyan
         :CreateTime: 2026-07-13 11:08:59
         """
-        return self.cache_dir / self._hash() / f"page-{page_number}-{dpi}.json"
+        suffix = "" if profile == "default" else f"-{profile}"
+        return self.cache_dir / self._hash() / f"page-{page_number}-{dpi}{suffix}.json"
 
-    def _read_cache(self, page_number: int, dpi: int) -> PageText | None:
+    def _read_cache(self, page_number: int, dpi: int, profile: str = "default") -> PageText | None:
         """
         【方法功能】读取已有 OCR JSON 缓存。
         :param page_number: int+页码
         :param dpi: int+OCR 分辨率
+        :param profile: str+OCR 策略缓存标识（默认default）
         :return: PageText|None+缓存页面，不存在或损坏时返回None
         :Author: gexinyan
         :CreateTime: 2026-07-13 11:08:59
         """
-        cache_path = self._cache_path(page_number, dpi)
+        cache_path = self._cache_path(page_number, dpi, profile)
         if not cache_path.exists():
             return None
         try:
@@ -447,15 +624,16 @@ class PDFTextEngine:
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
-    def _write_cache(self, page: PageText) -> None:
+    def _write_cache(self, page: PageText, profile: str = "default") -> None:
         """
         【方法功能】以 UTF-8 JSON 写入 OCR 结果缓存。
         :param page: PageText+待缓存页面
+        :param profile: str+OCR 策略缓存标识（默认default）
         :return: None
         :Author: gexinyan
         :CreateTime: 2026-07-13 11:08:59
         """
-        cache_path = self._cache_path(page.page_number, page.dpi)
+        cache_path = self._cache_path(page.page_number, page.dpi, profile)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "text": page.text,

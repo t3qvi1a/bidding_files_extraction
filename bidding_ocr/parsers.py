@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from bidding_ocr.models import ExtractionRecord, PageText
+from bidding_ocr.tender_cover_strategy import extract_tender_cover_fields
 from bidding_ocr.utils import compact_for_match, extract_company_names, normalize_text
 
 
@@ -300,7 +301,43 @@ def parse_tender_cover(pages: list[PageText], context: ParserContext) -> list[Ex
     """
     from bidding_ocr.utils import determine_cover_award_status
 
-    occurrences = find_company_occurrences(pages)
+    ordered_pages = sorted(pages, key=lambda page: page.page_number)
+    cover_text = "\n".join(page.text for page in ordered_pages if page.text)
+    cover_fields = extract_tender_cover_fields(
+        cover_text,
+        prefer_title=any(page.method == "ocr" for page in ordered_pages),
+    )
+    occurrences: list[CompanyOccurrence] = []
+    cover_companies = extract_company_names(cover_fields.company_name)
+    if cover_companies:
+        company_name = cover_companies[0]
+        matched_page = ordered_pages[0] if ordered_pages else None
+        matched_line = None
+        company_key = normalize_text(company_name)
+        for page in ordered_pages:
+            for line in page.lines:
+                if company_key and company_key in normalize_text(line.text):
+                    matched_page = page
+                    matched_line = line
+                    break
+            if matched_line is not None:
+                break
+        if matched_page is not None:
+            occurrences.append(
+                CompanyOccurrence(
+                    name=company_name,
+                    page_number=matched_page.page_number,
+                    evidence=(matched_line.text if matched_line else cover_fields.company_name)[:300],
+                    confidence=(
+                        matched_line.confidence
+                        if matched_line is not None and matched_page.method == "ocr"
+                        else matched_page.confidence
+                    ),
+                    method=matched_page.method,
+                )
+            )
+    if not occurrences:
+        occurrences = find_company_occurrences(ordered_pages)
     if not occurrences:
         filename_companies = extract_company_names(context.pdf_path.stem)
         occurrences = [
@@ -309,7 +346,26 @@ def parse_tender_cover(pages: list[PageText], context: ParserContext) -> list[Ex
         ]
     status = determine_cover_award_status(context.relative_path)
     statuses = {normalize_text(item.name): status for item in occurrences}
-    return _records_from_occurrences(occurrences[:1], pages, context, statuses, unknown_requires_review=True)
+    records = _records_from_occurrences(
+        occurrences[:1],
+        ordered_pages,
+        context,
+        statuses,
+        unknown_requires_review=True,
+    )
+    for record in records:
+        record.project_name = cover_fields.project_name or record.project_name
+        record.project_code = cover_fields.project_code or record.project_code
+        if cover_fields.project_code or cover_fields.lot_name:
+            record.lot_name = cover_fields.lot_name
+        needs_review = (
+            not record.project_name
+            or not record.company_name
+            or record.confidence < context.confidence_threshold
+            or record.award_status == "未知"
+        )
+        record.review_status = "待复核" if needs_review else "通过"
+    return records
 
 
 def parse_bid_evaluation_report(pages: list[PageText], context: ParserContext) -> list[ExtractionRecord]:

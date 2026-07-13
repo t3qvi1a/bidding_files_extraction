@@ -8,3 +8,4 @@ paddlepaddle>=3.0,<4.0
 
 # Image dependency
 Pillow>=10.0
+numpy>=1.26,<3.0

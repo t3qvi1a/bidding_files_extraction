@@ -1,9 +1,14 @@
-"""招投标 PDF 统一解析命令行入口。"""
+"""按指定类别运行真实 PDF 解析的命令行测试脚本。"""
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from bidding_ocr import ProcessingConfig, process_pdf_tree
 from bidding_ocr.models import CATEGORIES
@@ -11,15 +16,20 @@ from bidding_ocr.models import CATEGORIES
 
 def build_argument_parser() -> argparse.ArgumentParser:
     """
-    【函数功能】构建招投标 PDF 解析工具的命令行参数解析器。
+    【函数功能】构建单类别真实 PDF 解析测试脚本的命令行参数。
     :return: argparse.ArgumentParser+配置完成的参数解析器
     :Author: gexinyan
-    :CreateTime: 2026-07-13 11:08:59
+    :CreateTime: 2026-07-13 16:25:00
     Example: build_argument_parser()
     """
-    parser = argparse.ArgumentParser(description="批量解析招投标 PDF 并生成分类及汇总 CSV。")
+    parser = argparse.ArgumentParser(description="仅处理一种招投标 PDF 类别，用于真实样本调试。")
+    parser.add_argument("--category", required=True, choices=CATEGORIES, help="待测试的 PDF 类别")
     parser.add_argument("--input", default="pdf_files", help="PDF 输入目录，默认：pdf_files")
-    parser.add_argument("--output", default="results", help="结果输出目录，默认：results")
+    parser.add_argument(
+        "--output",
+        default="results/category_test",
+        help="测试结果目录，默认：results/category_test",
+    )
     parser.add_argument("--dpi", type=int, default=300, help="普通页面 OCR 分辨率，默认：300")
     parser.add_argument(
         "--archive-scan-dpi",
@@ -29,20 +39,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ocr-threshold", type=float, default=0.80, help="OCR 复核阈值，默认：0.80")
     parser.add_argument("--force", action="store_true", help="忽略 OCR 缓存并重新识别")
-    parser.add_argument(
-        "--category",
-        choices=CATEGORIES,
-        help="仅处理指定类别，例如：tender_cover；默认处理全部类别",
-    )
     return parser
 
 
 def main() -> int:
     """
-    【函数功能】执行命令行解析任务并输出中文运行摘要。
-    :return: int+进程退出码，0 表示全部文件已处理，1 表示存在失败文件
+    【函数功能】仅运行一个 PDF 类别并以进度日志输出真实样本解析结果。
+    :return: int+0 表示目标类别处理成功，1 表示无文件或存在失败
     :Author: gexinyan
-    :CreateTime: 2026-07-13 11:08:59
+    :CreateTime: 2026-07-13 16:25:00
     Example: main()
     """
     args = build_argument_parser().parse_args()
@@ -52,18 +57,22 @@ def main() -> int:
         ocr_confidence_threshold=args.ocr_threshold,
         force_ocr=args.force,
     )
+    output_dir = Path(args.output) / args.category
     summary = process_pdf_tree(
         Path(args.input),
-        Path(args.output),
+        output_dir,
         config,
         category_filter=args.category,
         progress_callback=lambda message: print(message, flush=True),
     )
+    if summary.total_files == 0:
+        print(f"未找到类别 {args.category} 的 PDF，请检查输入目录。")
+        return 1
     print(
-        f"处理完成：文件 {summary.total_files} 个，记录 {summary.total_records} 条，"
-        f"待复核 {summary.review_records} 条，失败 {summary.failed_files} 个。"
+        f"类别测试完成：{args.category}，文件 {summary.total_files} 个，"
+        f"记录 {summary.total_records} 条，失败 {summary.failed_files} 个。"
     )
-    print(f"结果目录：{Path(args.output).resolve()}")
+    print(f"测试结果目录：{output_dir.resolve()}")
     return 1 if summary.failed_files else 0
 
 
