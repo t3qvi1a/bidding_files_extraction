@@ -56,6 +56,11 @@ AWARD_NOTICE_NARRATIVE_PROJECT_RE = re.compile(
     r"(?P<project>[^，。；;]{4,100}?(?:项目|工程)[^，。；;]{0,40}?)"
     r"的(?:评标|评审|交易|招标)(?:工作)?(?:已经|已)?(?:结束|完成)"
 )
+AWARD_NOTICE_HEADER_CODE_RE = re.compile(
+    r"(?<![A-Z0-9])(?P<code>[A-Z][A-Z0-9]{4,}(?:-[A-Z]{0,3}\d{1,4})?)(?![A-Z0-9])"
+)
+AWARD_NOTICE_LOT_CODE_SUFFIX_RE = re.compile(r"-[A-Z]{0,3}\d{1,4}$")
+AWARD_NOTICE_HEADER_LINE_LIMIT = 8
 BID_LIST_UNIT_HEADER_LABELS = ("单位名称", "投标单位名称", "投标人名称", "投标单位")
 BID_LIST_TABLE_HEADER_LABELS = (
     "序号",
@@ -274,6 +279,32 @@ def extract_award_notice_project_name(pages: list[PageText]) -> str:
             if project_name:
                 return project_name
     return ""
+
+
+def extract_award_notice_codes(pages: list[PageText]) -> tuple[str, str]:
+    """
+    【函数功能】从中标或交易结果通知书首页抬头提取项目编号和标段编号。
+    :param pages: list[PageText]+中标或交易结果通知书页面
+    :return: tuple[str, str]+项目编号、标段编号；未识别字段返回空字符串
+    :Author: gexinyan
+    :CreateTime: 2026-07-14 14:25:50
+    Example: extract_award_notice_codes([page])
+    """
+    for page in sorted(pages, key=lambda item: item.page_number):
+        header_lines = [line.text for line in page.lines if line.text.strip()][
+            :AWARD_NOTICE_HEADER_LINE_LIMIT
+        ]
+        for line in header_lines:
+            normalized_line = normalize_text(line).upper()
+            normalized_line = normalized_line.replace("－", "-").replace("—", "-").replace("–", "-")
+            match = AWARD_NOTICE_HEADER_CODE_RE.search(normalized_line)
+            if match is None:
+                continue
+            lot_code = match.group("code")
+            lot_suffix_match = AWARD_NOTICE_LOT_CODE_SUFFIX_RE.search(lot_code)
+            project_code = lot_code[: lot_suffix_match.start()] if lot_suffix_match else lot_code
+            return project_code, lot_code if lot_suffix_match else ""
+    return "", ""
 
 
 def _project_name_without_lot_suffix(value: str) -> str:
@@ -1161,9 +1192,18 @@ def parse_award_notice(pages: list[PageText], context: ParserContext) -> list[Ex
     statuses = {normalize_text(item.name): "是" for item in occurrences if item}
     records = _records_from_occurrences([item for item in occurrences if item], pages, context, statuses)
     project_name = extract_award_notice_project_name(pages)
+    project_code, lot_code = extract_award_notice_codes(pages)
     if project_name:
         for record in records:
             record.project_name = project_name
+    for record in records:
+        record.lot_name = record.project_name
+    if project_code or lot_code:
+        for record in records:
+            if project_code:
+                record.project_code = project_code
+            if lot_code:
+                record.lot_code = lot_code
     return records
 
 

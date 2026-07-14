@@ -337,7 +337,46 @@ class ParserTests(unittest.TestCase):
 
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].project_name, "花苑村高标准农田建设项目（二期）施工")
+        self.assertEqual(records[0].lot_name, "花苑村高标准农田建设项目（二期）施工")
         self.assertEqual(records[0].company_name, "江苏岳泰建设工程有限公司")
+
+    def test_award_notice_extracts_project_and_lot_codes_from_header(self) -> None:
+        """
+        【方法功能】验证通知书抬头编号支持标题下方和独立编号行两种版式。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 14:25:50
+        """
+        cases = [
+            (
+                [
+                    "交易结果通知书",
+                    "HSLS20201011-01",
+                    "甲建设有限公司：",
+                    "甲方的测试农田建设项目施工的评审工作已经结束。",
+                ],
+                "HSLS20201011",
+                "HSLS20201011-01",
+            ),
+            (
+                [
+                    "中标通知书",
+                    "编号：",
+                    "WXHS20210908001-S04",
+                    "乙建设有限公司：",
+                    "乙方的测试水利建设项目施工的评标工作已经结束。",
+                ],
+                "WXHS20210908001",
+                "WXHS20210908001-S04",
+            ),
+        ]
+
+        for lines, expected_project_code, expected_lot_code in cases:
+            with self.subTest(expected_lot_code=expected_lot_code):
+                records = parse_award_notice([make_page(1, lines)], self._context("award_notice"))
+
+                self.assertEqual(records[0].project_code, expected_project_code)
+                self.assertEqual(records[0].lot_code, expected_lot_code)
 
     def test_bid_announcement_truncates_merged_metadata_fields(self) -> None:
         """
