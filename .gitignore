@@ -5,3 +5,4 @@ __pycache__/
 *.py[cod]
 .venv/
 .paddlex_cache/
+tmp/

@@ -27,8 +27,20 @@ COVER_PROJECT_TITLE_KEYWORDS = (
 COVER_CODE_LABELS = ("标段编号", "项目编号", "招标编号", "交易编号", "编号")
 COVER_PROJECT_LABELS = ("项目名称", "工程名称", "招标项目名称")
 COVER_BIDDER_LABELS = ("投标人名称", "投标单位名称", "投标人", "参与单位")
+COVER_PROJECT_STOP_PREFIXES = (
+    "投标文件",
+    "参与文件",
+    *COVER_BIDDER_LABELS,
+    "法定代表人",
+    "其委托代理人",
+    "日期",
+)
+COVER_GENERIC_PROJECT_TITLES = ("建设工程", "建设项目", "水利工程", "整治工程", "施工")
 COVER_CHINESE_SECTION_RE = re.compile(r"第?[一二三四五六七八九十0-9]{1,3}(?:标段|合同段|施工标)")
 COVER_PROJECT_CODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-/]{5,}")
+COVER_TEMPLATE_FIELD_RE = re.compile(
+    r"[（(【\[]?\s*(?:工程项目名称|工程名称|项目名称|标段名称)\s*[）)】\]]?"
+)
 COVER_COMPANY_RE = re.compile(
     r"[\u4e00-\u9fffA-Za-z0-9（）()·&\-]{2,80}?"
     r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司|研究院|研究所|集团|公司)"
@@ -319,6 +331,7 @@ def normalize_cover_text_for_parse(text: str) -> str:
         "项且": "项目",
         "项日": "项目",
         "项口": "项目",
+        "项旦": "项目",
         "建没": "建设",
         "健设": "建设",
         "高标准农日": "高标准农田",
@@ -382,6 +395,8 @@ def is_cover_title_noise_line(line: str) -> bool:
         return True
     if not compact_line or compact_line in {"投标文件", "参与文件", "商务标", "技术标", "资格审查资料"}:
         return True
+    if any(compact_line.startswith(prefix) for prefix in COVER_PROJECT_STOP_PREFIXES):
+        return True
     if is_template_project_line(compact_line):
         return True
     if re.fullmatch(r"第?\d+页[/／共\d+页]*", compact_line):
@@ -399,9 +414,30 @@ def has_project_title_keyword(value: str) -> bool:
     Example: has_project_title_keyword("某高标准农田建设工程")
     """
     compact_value = clean_cell(value)
+    if compact_value in COVER_GENERIC_PROJECT_TITLES:
+        return False
     if any(keyword in compact_value for keyword in COVER_PROJECT_TITLE_KEYWORDS):
         return True
     return bool(re.search(r"高标准农田.*?(?:项目|工程)", compact_value))
+
+
+def is_valid_project_name_candidate(value: str) -> bool:
+    """
+    【函数功能】判断项目名称候选是否完整且未混入投标主体、文档类型或项目编号。
+    :param value: str+已清理项目名称候选
+    :return: bool+是否可作为最终项目名称
+    :Author: gexinyan
+    :CreateTime: 2026-07-14 12:00:00
+    Example: is_valid_project_name_candidate("某高标准农田建设项目")
+    """
+    compact_value = clean_cell(value)
+    if not compact_value or compact_value in COVER_GENERIC_PROJECT_TITLES:
+        return False
+    if any(marker in compact_value for marker in COVER_PROJECT_STOP_PREFIXES):
+        return False
+    if COVER_PROJECT_CODE_RE.search(compact_value):
+        return False
+    return has_project_title_keyword(compact_value)
 
 
 def strip_bid_file_project_noise(value: str) -> str:
@@ -429,9 +465,8 @@ def strip_bid_file_project_noise(value: str) -> str:
         index = text.find(clean_cell(label))
         if index > 0:
             text = text[:index]
-    text = re.sub(r"[（(]工程项目名称[）)]", "", text)
-    text = re.sub(r"[（(]工程名称[）)]", "", text)
-    text = re.sub(r"[（(]标段名称[）)]", "", text)
+    text = COVER_TEMPLATE_FIELD_RE.sub("", text)
+    text = re.sub(r"^(?:项目名称|工程名称|招标项目名称)[:：]*", "", text)
     text = re.sub(r"(?:工程)?施工招标$", "", text)
     text = re.sub(r"招标文件$", "", text)
     text = re.sub(r"(?:投标|参与)文件$", "", text)
@@ -506,19 +541,21 @@ def extract_project_name_before_code(text: str) -> str:
         pieces: list[str] = []
         for previous_line in reversed(lines[max(0, line_index - 40) : line_index]):
             compact_previous = clean_cell(previous_line)
+            if any(marker in compact_previous for marker in (*COVER_BIDDER_LABELS, "法定代表人", "日期")):
+                break
             if is_template_project_line(compact_previous):
                 continue
             if is_cover_title_noise_line(compact_previous):
                 continue
             if len(compact_previous) <= 3:
                 continue
-            if any(stop in compact_previous for stop in ("投标人", "参与单位", "法定代表人", "日期")):
-                break
+            if COVER_PROJECT_CODE_RE.fullmatch(compact_previous):
+                continue
             pieces.insert(0, compact_previous)
             if has_project_title_keyword(compact_previous):
                 break
         candidate = strip_bid_file_project_noise("".join(pieces))
-        if has_project_title_keyword(candidate):
+        if is_valid_project_name_candidate(candidate):
             return candidate
     return ""
 
@@ -648,22 +685,28 @@ def extract_bid_file_title_project_name(text: str) -> str:
     compact_labels = [clean_cell(value) for value in COVER_CODE_LABELS]
     for line in cover_lines(text):
         compact_line = clean_cell(line)
-        if compact_line in {"投标文件", "参与文件"} or any(label in compact_line for label in compact_labels):
+        if (
+            any(compact_line.startswith(prefix) for prefix in ("投标文件", "参与文件"))
+            or any(label in compact_line for label in compact_labels)
+            or COVER_PROJECT_CODE_RE.fullmatch(compact_line)
+        ):
             break
+        if is_template_project_line(compact_line):
+            continue
         if is_cover_title_noise_line(compact_line):
             if prefix_lines:
                 break
             continue
         prefix_lines.append(compact_line)
     cleaned = strip_bid_file_project_noise("".join(prefix_lines))
-    return cleaned if has_project_title_keyword(cleaned) else ""
+    return cleaned if is_valid_project_name_candidate(cleaned) else ""
 
 
 def extract_bid_file_project_name(text: str, prefer_title: bool = False) -> str:
     """
-    【函数功能】结合标签、编号前标题和顶部标题三种策略提取项目名称。
+    【函数功能】按明确字段、顶部标题和编号前标题顺序提取项目名称。
     :param text: str+封面文本
-    :param prefer_title: bool+是否优先标题候选（默认False）
+    :param prefer_title: bool+保留的调用兼容参数，明确字段始终优先（默认False）
     :return: str+项目名称
     :Author: gexinyan
     :CreateTime: 2026-07-13 14:20:13
@@ -687,14 +730,12 @@ def extract_bid_file_project_name(text: str, prefer_title: bool = False) -> str:
     )
     before_code_candidate = extract_project_name_before_code(normalized)
     title_candidate = extract_bid_file_title_project_name(normalized)
-    candidates = [label_candidate, before_code_candidate, title_candidate]
-    if prefer_title and title_candidate:
-        candidates = [before_code_candidate, title_candidate, label_candidate]
+    candidates = [label_candidate, title_candidate, before_code_candidate]
     for candidate in candidates:
         cleaned = strip_bid_file_project_noise(candidate)
-        if cleaned and has_project_title_keyword(cleaned):
+        if is_valid_project_name_candidate(cleaned):
             return cleaned
-    return next((strip_bid_file_project_noise(candidate) for candidate in candidates if candidate), "")
+    return ""
 
 
 def strip_stamp(value: str) -> str:

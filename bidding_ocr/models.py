@@ -21,6 +21,7 @@ CSV_FIELDS = (
     "序号",
     "项目名称",
     "项目编号",
+    "标段编号",
     "标段名称",
     "公司名称",
     "中标与否",
@@ -133,6 +134,7 @@ class ExtractionRecord:
     :Attributes:
         project_name: str+项目名称
         project_code: str+项目编号
+        lot_code: str+标段编号
         lot_name: str+标段名称
         company_name: str+公司名称
         award_status: str+中标状态
@@ -151,6 +153,7 @@ class ExtractionRecord:
 
     project_name: str = ""
     project_code: str = ""
+    lot_code: str = ""
     lot_name: str = ""
     company_name: str = ""
     award_status: str = "未知"
@@ -176,6 +179,7 @@ class ExtractionRecord:
             "序号": sequence,
             "项目名称": self.project_name,
             "项目编号": self.project_code,
+            "标段编号": self.lot_code,
             "标段名称": self.lot_name,
             "公司名称": self.company_name,
             "中标与否": self.award_status,

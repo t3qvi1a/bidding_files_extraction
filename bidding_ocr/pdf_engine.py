@@ -117,7 +117,6 @@ class RapidOCRBackend(OCRBackend):
         【方法功能】调用 RapidOCR 识别 RGB 图像并转换为统一文字行。
         :param image: Any+页面 RGB 图像数组
         :return: list[OCRLine]+按页面阅读顺序排列的 OCR 文字行
-        :raises RuntimeError: OCR 未返回可解析文字时触发
         :Author: gexinyan
         :CreateTime: 2026-07-14 10:30:00
         """
@@ -132,8 +131,6 @@ class RapidOCRBackend(OCRBackend):
                 continue
             bbox = np.asarray(box).tolist() if box is not None else []
             lines.append(OCRLine(text, float(score), bbox))
-        if not lines:
-            raise RuntimeError("RapidOCR 未返回可解析文字")
         return sort_ocr_lines(lines)
 
     def prepare(self) -> None:
@@ -214,7 +211,7 @@ class PDFTextEngine:
         """
         try:
             if self._reader_kind == "pypdf":
-                return self.reader.pages[page_number - 1].extract_text() or ""
+                return self.reader.pages[page_number - 1].extract_text(extraction_mode="layout") or ""
             page = self.reader[page_number - 1]
             text_page = page.get_textpage()
             return text_page.get_text_range() or ""
@@ -287,17 +284,27 @@ class PDFTextEngine:
         native = self.native_text(page_number)
         if not force_ocr and is_readable_chinese_text(native):
             lines = [OCRLine(line.strip(), 1.0, []) for line in native.splitlines() if line.strip()]
+            self._emit_progress(f"页面 OCR：第{page_number}页使用原生文本层，跳过 OCR。")
             return PageText(page_number, "\n".join(line.text for line in lines), lines, "text", 0)
 
         actual_dpi = dpi or self.config.dpi
         cached = self._read_cache(page_number, actual_dpi, RAPIDOCR_CACHE_PROFILE)
         if cached is not None and not self.config.force_ocr:
+            self._emit_progress(f"页面 OCR：第{page_number}页命中缓存，跳过识别。")
             self.ocr_pages.add(page_number)
             return cached
 
-        self.ocr_backend.prepare()
-        image = self._render_page_image(page_number, actual_dpi)
-        lines = self.ocr_backend.recognize(image)
+        self._emit_progress(f"页面 OCR：第{page_number}页开始，DPI {actual_dpi}。")
+        started_at = time.perf_counter()
+        try:
+            self.ocr_backend.prepare()
+            image = self._render_page_image(page_number, actual_dpi)
+            lines = self.ocr_backend.recognize(image)
+        except Exception:
+            self._emit_progress(
+                f"页面 OCR：第{page_number}页失败，总耗时 {time.perf_counter() - started_at:.1f} 秒。"
+            )
+            raise
         page = PageText(
             page_number=page_number,
             text="\n".join(line.text for line in lines),
@@ -307,6 +314,10 @@ class PDFTextEngine:
         )
         self._write_cache(page, RAPIDOCR_CACHE_PROFILE)
         self.ocr_pages.add(page_number)
+        self._emit_progress(
+            f"页面 OCR：第{page_number}页完成，DPI {actual_dpi}，识别 {len(lines)} 行，"
+            f"总耗时 {time.perf_counter() - started_at:.1f} 秒。"
+        )
         return page
 
     def get_tender_cover_page(self, page_number: int, dpi: int | None = None) -> PageText:
@@ -325,6 +336,7 @@ class PDFTextEngine:
         native = self.native_text(page_number)
         if not cover_text_needs_ocr(native):
             lines = [OCRLine(line.strip(), 1.0, []) for line in native.splitlines() if line.strip()]
+            self._emit_progress(f"封面 OCR：第{page_number}页使用原生文本层，跳过 OCR。")
             return PageText(page_number, "\n".join(line.text for line in lines), lines, "text", 0)
 
         actual_dpi = dpi or self.config.dpi
@@ -371,6 +383,9 @@ class PDFTextEngine:
 
         if not best_lines:
             error_message = "；".join(errors) if errors else "OCR 未返回文字"
+            self._emit_progress(
+                f"封面 OCR：第{page_number}页失败，总耗时 {time.perf_counter() - started_at:.1f} 秒。"
+            )
             raise RuntimeError(f"投标封面多策略 OCR 失败：{error_message}")
         best_lines = self._merge_cover_company_candidate(best_lines, candidates)
         page = PageText(

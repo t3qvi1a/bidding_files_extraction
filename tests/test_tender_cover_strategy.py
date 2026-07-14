@@ -16,8 +16,10 @@ from bidding_ocr.pipeline import load_pages_for_category
 from bidding_ocr.tender_cover_strategy import (
     build_cover_image_variants,
     extract_tender_cover_fields,
+    is_valid_project_name_candidate,
     is_fragmented_cover_text,
     remove_red_seal,
+    strip_bid_file_project_noise,
     suppress_red_seal_by_red_channel,
 )
 
@@ -227,6 +229,53 @@ class RecordingPageEngine:
         return []
 
 
+class EvaluationReportPageEngine:
+    """
+    【类功能】模拟多页评标报告并记录不同 OCR 分辨率的页面读取。
+    :Attributes:
+        page_count: int+固定页面总数
+        calls: list[tuple[int, int]]+页面与分辨率调用记录
+    :Author: gexinyan
+    :CreateTime: 2026-07-14 16:00:00
+    """
+
+    def __init__(self) -> None:
+        """
+        【方法功能】初始化固定评标报告页面和调用记录。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 16:00:00
+        """
+        self.page_count = 4
+        self.calls: list[tuple[int, int]] = []
+
+    def get_page(self, page_number: int, dpi: int) -> PageText:
+        """
+        【方法功能】记录读取参数并返回对应的模拟 OCR 页面。
+        :param page_number: int+从1开始的页面序号
+        :param dpi: int+OCR 分辨率
+        :return: PageText+模拟评标报告页面
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 16:00:00
+        """
+        self.calls.append((page_number, dpi))
+        texts = {
+            1: ["项目名称：测试农田建设项目"],
+            2: ["目录", "投标人排序及推荐的中标候选人名单"],
+            3: [
+                "投标人排序及推荐的中标候选人名单",
+                "投标人名称",
+                "甲建设有限公司",
+                "推荐的中标候选人",
+                "第一名",
+                "甲建设有限公司",
+            ],
+            4: ["评标委员会签名"],
+        }[page_number]
+        lines = [OCRLine(text, 0.99, []) for text in texts]
+        return PageText(page_number, "\n".join(texts), lines, "ocr", dpi)
+
+
 class TenderCoverStrategyTests(unittest.TestCase):
     """
     【类功能】验证四种封面版式、红章预处理、多策略选择和类别隔离。
@@ -247,6 +296,96 @@ class TenderCoverStrategyTests(unittest.TestCase):
                 self.assertEqual(fields.project_name, project_name)
                 self.assertEqual(fields.project_code, project_code)
                 self.assertEqual(fields.company_name, company_name)
+
+    def test_strip_project_template_fragments_with_mixed_brackets(self) -> None:
+        """
+        【方法功能】验证项目名清理可移除 OCR 产生的混合括号模板字段残留。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 11:00:00
+        """
+        expected = "花苑村高标准农田建设项目(二期)施工"
+        candidates = (
+            "花苑村高标准农田建设项目(二期)【工程名称)施工标段名称)",
+            "花苑村高标准农田建设项目(二期)【工程名称)施工",
+            "花苑村高标准农田建设项目(二期）（工程名称)施工（标段名称)",
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                self.assertEqual(strip_bid_file_project_noise(candidate), expected)
+
+    def test_extract_project_name_from_actual_template_ocr_text(self) -> None:
+        """
+        【方法功能】验证实际封面 OCR 模板残留经字段提取后统一保留项目施工名称。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 11:00:00
+        """
+        expected = "花苑村高标准农田建设项目(二期)施工"
+        texts = (
+            "花苑村高标准农田建设项目(二期）【工程名称)\n施工 标段名称)\n参与文件\n交易编号：HSLS2021011-01\n参与单位：江苏嘉奕建设有限公司盖单位章）",
+            "花苑村高标准农田建设项目(二期）【工程名称)\n施工（标段名称）\n参与文件\n交易编号：HSLS2021011-01\n参与单位：无锡润华市政绿化有限公司",
+        )
+        for text in texts:
+            with self.subTest(text=text):
+                fields = extract_tender_cover_fields(text, prefer_title=True)
+                self.assertEqual(fields.project_name, expected)
+
+    def test_project_name_prefers_explicit_label_over_incomplete_title(self) -> None:
+        """
+        【方法功能】验证明确项目名称字段优先于标题碎片，并正确拼接断行字段值。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 12:00:00
+        """
+        cases = (
+            (
+                """前洲街道张皋庄村高标准农田建设工程（工
+程项目名称）前洲街道张皋庄村高标准农田
+建设工程（标段名称）工程施工招标
+投标文件
+项目编号：WXHS20231116001-S01
+项目名称：前洲街道张皋庄村高标准农田建设工程
+投标人：无锡盛佳亿建设工程有限公司（盖公章)""",
+                "前洲街道张皋庄村高标准农田建设工程",
+            ),
+            (
+                """投标人：汇苏祥通设有公司
+项目名称：2024年度江苏省无锡市惠山区玉祁街道水稻园
+区高标准农田建设改造提升项目 （财政补助）
+投标文件内：设际件
+投标人：汇苏祥通设有卧公司口（盖公章）""",
+                "2024年度江苏省无锡市惠山区玉祁街道水稻园区高标准农田建设改造提升项目(财政补助)",
+            ),
+            (
+                """投标人：宜兴市才利工程有限公司
+2024年度江苏省无锡市惠山区玉祁街道水稻园区高标
+准农田建设改造提升项目（财政补助）施工招标
+投标文件
+WXHS20240801001-S01
+项目编号：_
+项目名称：2024年度江苏省无锡市惠山区玉祁街道水稻园区高标准
+农田建设改造提升项旦（财政补助）
+投标人：_宜兴市力利工程有公司（盖公章)""",
+                "2024年度江苏省无锡市惠山区玉祁街道水稻园区高标准农田建设改造提升项目(财政补助)",
+            ),
+        )
+        for text, expected in cases:
+            with self.subTest(expected=expected):
+                fields = extract_tender_cover_fields(text, prefer_title=True)
+                self.assertEqual(fields.project_name, expected)
+
+    def test_generic_project_title_is_rejected(self) -> None:
+        """
+        【方法功能】验证通用工程词和混入投标人字段的候选不能作为项目名称。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 12:00:00
+        """
+        self.assertFalse(is_valid_project_name_candidate("建设工程"))
+        self.assertFalse(
+            is_valid_project_name_candidate("投标人：某公司：某高标准农田建设项目")
+        )
 
     def test_parse_tender_cover_keeps_unified_record_fields(self) -> None:
         """
@@ -386,6 +525,25 @@ class TenderCoverStrategyTests(unittest.TestCase):
         load_pages_for_category(engine, "bid_list", config)
         self.assertEqual(engine.tender_calls, 1)
         self.assertEqual(engine.generic_calls, 1)
+
+    def test_evaluation_report_scans_then_reloads_only_target_table(self) -> None:
+        """
+        【方法功能】验证评标报告低清扫描全文后仅高精度重读真实排序表页。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 16:00:00
+        """
+        engine = EvaluationReportPageEngine()
+        pages, warnings = load_pages_for_category(
+            engine,
+            "bid_evaluation_report",
+            ProcessingConfig(dpi=300, archive_scan_dpi=150),
+        )
+
+        self.assertEqual(engine.calls, [(1, 150), (2, 150), (3, 150), (4, 150), (3, 300)])
+        self.assertEqual([page.page_number for page in pages], [1, 2, 3, 4])
+        self.assertEqual(next(page for page in pages if page.page_number == 3).dpi, 300)
+        self.assertEqual(warnings, [])
 
 
 if __name__ == "__main__":

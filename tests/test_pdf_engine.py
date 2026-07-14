@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from pypdf import PdfWriter
@@ -43,6 +44,25 @@ class FakeOCRBackend(OCRBackend):
         if not isinstance(image, np.ndarray):
             raise AssertionError("测试页面图像未使用内存数组传递")
         return [OCRLine("项目名称：缓存测试项目", 0.99, [[0, 0], [10, 0], [10, 10], [0, 10]])]
+
+
+class EmptyOCRBackend(OCRBackend):
+    """
+    【类功能】为 PDF 引擎测试模拟无文字的空白 OCR 页面。
+    :Author: gexinyan
+    :CreateTime: 2026-07-14 14:30:00
+    """
+
+    def recognize(self, image: np.ndarray) -> list[OCRLine]:
+        """
+        【函数功能】返回空 OCR 结果以模拟无内容页面。
+        :param image: np.ndarray+测试页面 RGB 图像
+        :return: list[OCRLine]+空文字行列表
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 14:30:00
+        Example: recognize(np.zeros((10, 10, 3)))
+        """
+        return []
 
 
 class StubRenderPDFTextEngine(PDFTextEngine):
@@ -106,6 +126,127 @@ class PDFEngineTests(unittest.TestCase):
             cache_files = list((root / "cache").rglob("*.json"))
             self.assertEqual(len(cache_files), 1)
             self.assertIn("rapidocr-v1", cache_files[0].name)
+
+    def test_native_text_uses_layout_extraction_mode(self) -> None:
+        """
+        【函数功能】验证原生文本提取请求 pypdf 保留页面版式。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 11:00:00
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "blank.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=595, height=842)
+            with pdf_path.open("wb") as stream:
+                writer.write(stream)
+            engine = PDFTextEngine(pdf_path, root / "cache", ProcessingConfig())
+            page = MagicMock()
+            page.extract_text.return_value = "项目名称：版式测试项目"
+            engine.reader = MagicMock(pages=[page])
+            engine._reader_kind = "pypdf"
+
+            self.assertEqual(engine.native_text(1), "项目名称：版式测试项目")
+            page.extract_text.assert_called_once_with(extraction_mode="layout")
+
+    def test_unreadable_native_text_falls_back_to_ocr(self) -> None:
+        """
+        【函数功能】验证乱码原生文本层会调用 OCR 并返回 OCR 页面。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 11:00:00
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "blank.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=595, height=842)
+            with pdf_path.open("wb") as stream:
+                writer.write(stream)
+            backend = FakeOCRBackend()
+            engine = StubRenderPDFTextEngine(pdf_path, root / "cache", ProcessingConfig(), backend)
+
+            with patch.object(engine, "native_text", return_value="\ufffd\ufffd\ufffd\u65e0\u6548\u6587\u672c"):
+                page = engine.get_page(1, 150)
+
+            self.assertEqual(page.method, "ocr")
+            self.assertEqual(backend.calls, 1)
+
+    def test_empty_ocr_page_returns_empty_page_without_error(self) -> None:
+        """
+        【方法功能】验证空白页 OCR 无文字时返回空页面而非抛出异常。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 14:30:00
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "blank.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=595, height=842)
+            with pdf_path.open("wb") as stream:
+                writer.write(stream)
+            engine = StubRenderPDFTextEngine(
+                pdf_path,
+                root / "cache",
+                ProcessingConfig(),
+                EmptyOCRBackend(),
+            )
+
+            page = engine.get_page(1, 150)
+
+            self.assertEqual(page.method, "ocr")
+            self.assertEqual(page.text, "")
+            self.assertEqual(page.lines, [])
+
+    def test_generic_page_ocr_emits_page_timing_progress(self) -> None:
+        """
+        【方法功能】验证通用页面 OCR、缓存命中与原生文本路径均输出明确进度消息。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 11:30:00
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "blank.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=595, height=842)
+            with pdf_path.open("wb") as stream:
+                writer.write(stream)
+            backend = FakeOCRBackend()
+            messages: list[str] = []
+            engine = StubRenderPDFTextEngine(
+                pdf_path,
+                root / "cache",
+                ProcessingConfig(),
+                backend,
+                messages.append,
+            )
+            engine.get_page(1, 150)
+            self.assertTrue(any("第1页开始，DPI 150" in message for message in messages))
+            self.assertTrue(any("第1页完成，DPI 150，识别 1 行" in message for message in messages))
+
+            cached_messages: list[str] = []
+            cached_engine = StubRenderPDFTextEngine(
+                pdf_path,
+                root / "cache",
+                ProcessingConfig(),
+                backend,
+                cached_messages.append,
+            )
+            cached_engine.get_page(1, 150)
+            self.assertTrue(any("命中缓存，跳过识别" in message for message in cached_messages))
+
+            native_messages: list[str] = []
+            with patch.object(
+                engine,
+                "native_text",
+                return_value="项目名称：这是一个用于验证原生文本处理流程的高标准农田建设项目",
+            ):
+                engine.progress_callback = native_messages.append
+                engine.get_page(1, 150)
+            self.assertTrue(any("使用原生文本层，跳过 OCR" in message for message in native_messages))
 
     def test_ocr_lines_are_sorted_by_rows_and_columns(self) -> None:
         """

@@ -20,7 +20,11 @@ from bidding_ocr.models import (
     ProcessingConfig,
     ProcessSummary,
 )
-from bidding_ocr.parsers import ParserContext, parse_document
+from bidding_ocr.parsers import (
+    ParserContext,
+    find_bid_evaluation_report_target_pages,
+    parse_document,
+)
 from bidding_ocr.pdf_engine import OCRBackend, PDFTextEngine, RapidOCRBackend
 from bidding_ocr.utils import classify_pdf, compact_for_match, normalize_text
 
@@ -315,6 +319,8 @@ def load_pages_for_category(
     """
     if category == "archive_info":
         return _load_archive_pages(engine, config)
+    if category == "bid_evaluation_report":
+        return _load_bid_evaluation_report_pages(engine, config)
     if category == "tender_cover":
         if engine.page_count > 3:
             page_numbers = engine.cover_bookmark_pages() or list(range(1, min(5, engine.page_count) + 1))
@@ -410,6 +416,36 @@ def _load_archive_pages(
     if not matched:
         warnings.append("备案资料全文未命中目标关键词")
     return pages, warnings
+
+
+def _load_bid_evaluation_report_pages(
+    engine: PDFTextEngine,
+    config: ProcessingConfig,
+) -> tuple[list[PageText], list[str]]:
+    """
+    【函数功能】低清扫描评标报告全文后，仅高精度读取真实投标排序表页。
+    :param engine: PDFTextEngine+PDF 文本与 OCR 引擎
+    :param config: ProcessingConfig+处理配置
+    :return: tuple[list[PageText], list[str]]+保留元数据的页面列表和页级告警
+    :Author: gexinyan
+    :CreateTime: 2026-07-14 16:00:00
+    Example: _load_bid_evaluation_report_pages(engine, config)
+    """
+    scan_pages, warnings = _load_selected_pages(
+        engine,
+        range(1, engine.page_count + 1),
+        config.archive_scan_dpi,
+    )
+    target_numbers = find_bid_evaluation_report_target_pages(scan_pages)
+    if not target_numbers:
+        warnings.append("评标报告低清扫描未定位排序表，已退回全文高精度识别")
+        return _load_selected_pages(engine, range(1, engine.page_count + 1), config.dpi)
+
+    detail_pages, detail_warnings = _load_selected_pages(engine, target_numbers, config.dpi)
+    warnings.extend(detail_warnings)
+    pages_by_number = {page.page_number: page for page in scan_pages}
+    pages_by_number.update({page.page_number: page for page in detail_pages})
+    return [pages_by_number[number] for number in sorted(pages_by_number)], warnings
 
 
 def write_records_csv(path: Path, records: list[ExtractionRecord]) -> None:
