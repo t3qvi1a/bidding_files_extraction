@@ -45,7 +45,6 @@ class ProcessingConfig:
         archive_scan_dpi: int+备案资料全文粗检分辨率
         ocr_confidence_threshold: float+低于该值时进入人工复核
         force_ocr: bool+是否忽略已有 OCR 缓存
-        poppler_path: Path|None+可选 Poppler 可执行文件目录或文件路径
     :Author: gexinyan
     :CreateTime: 2026-07-13 11:08:59
     """
@@ -54,7 +53,6 @@ class ProcessingConfig:
     archive_scan_dpi: int = 150
     ocr_confidence_threshold: float = 0.80
     force_ocr: bool = False
-    poppler_path: Path | None = None
 
 
 @dataclass(slots=True)

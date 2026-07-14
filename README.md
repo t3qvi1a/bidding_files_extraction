@@ -5,8 +5,8 @@
 ## 环境与安装
 
 - Python 3.10 及以上版本。
-- Poppler，需要能够执行 `pdftoppm`。Windows 可通过环境变量 `POPPLER_PATH` 指向 Poppler 的 `bin` 目录。
-- PaddleOCR 中文模型。首次识别时 PaddleOCR 会下载模型，需要网络连接；之后可离线使用缓存模型。
+- `pypdfium2` 用于内存渲染 PDF 页面，无需安装 Poppler。
+- RapidOCR（ONNX Runtime）用于中文 OCR。首次运行请确保依赖已按下方命令安装完成。
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -19,15 +19,7 @@ conda env create -f environment.yml
 conda run -n bidding-ocr python main.py --input pdf_files --output results
 ```
 
-如果本机已有 `screen-parser-mvp` Conda 环境，可直接复用其中的 PaddleOCR 3.7.0、PaddlePaddle 3.3.1 和缓存模型，无需重新下载：
-
-```powershell
-conda run -n screen-parser-mvp python main.py --input pdf_files --output results
-```
-
-代码会优先使用 `pypdf`，环境未安装该包时自动回退到 `pypdfium2`。
-
-PaddleX 模型默认缓存到当前项目的 `.paddlex_cache`，避免 Windows 沙箱或账户权限导致无法读取用户目录下的 `~/.paddlex`。首次使用仍需下载检测和识别模型。
+代码使用 `pypdf` 读取原生文本和书签，使用 `pypdfium2` 将扫描页直接渲染为内存 RGB 图像后交给 RapidOCR。
 
 ## 运行
 
@@ -44,7 +36,7 @@ python main.py --input pdf_files --output results
 --force                   忽略 OCR JSON 缓存并重新识别
 ```
 
-OCR 缓存位于 `results/.ocr_cache`，缓存键包含 PDF SHA-256、页码和分辨率。删除该目录或使用 `--force` 可重新识别。
+OCR 缓存位于 `results/.ocr_cache`，缓存键包含 PDF SHA-256、页码、分辨率和 OCR 策略 profile。RapidOCR 使用独立 profile，不会复用旧 PaddleOCR 缓存；删除该目录或使用 `--force` 可重新识别。
 
 ## 输出
 

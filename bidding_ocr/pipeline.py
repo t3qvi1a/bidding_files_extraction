@@ -21,7 +21,7 @@ from bidding_ocr.models import (
     ProcessSummary,
 )
 from bidding_ocr.parsers import ParserContext, parse_document
-from bidding_ocr.pdf_engine import OCRBackend, PDFTextEngine, PaddleOCRBackend
+from bidding_ocr.pdf_engine import OCRBackend, PDFTextEngine, RapidOCRBackend
 from bidding_ocr.utils import classify_pdf, compact_for_match, normalize_text
 
 
@@ -76,7 +76,7 @@ def process_pdf_tree(
     :param config: ProcessingConfig|None+可选处理配置
     :param category_filter: str|None+可选标准类别，仅处理该类别 PDF（默认处理全部）
     :param progress_callback: ProgressCallback|None+可选运行进度消息回调（默认不输出）
-    :param ocr_backend: OCRBackend|None+可选共享 OCR 后端（默认本次运行创建一个 PaddleOCR 后端）
+    :param ocr_backend: OCRBackend|None+可选共享 OCR 后端（默认本次运行创建一个 RapidOCR 后端）
     :return: ProcessSummary+本次运行统计
     :raises FileNotFoundError: 输入目录不存在时触发
     :Author: gexinyan
@@ -90,7 +90,7 @@ def process_pdf_tree(
     if category_filter is not None and category_filter not in CATEGORIES:
         raise ValueError(f"不支持的 PDF 类别：{category_filter}")
     actual_config = config or ProcessingConfig()
-    shared_ocr_backend = ocr_backend or PaddleOCRBackend()
+    shared_ocr_backend = ocr_backend or RapidOCRBackend()
     output_path.mkdir(parents=True, exist_ok=True)
     cache_dir = output_path / ".ocr_cache"
     started_at = current_timestamp()

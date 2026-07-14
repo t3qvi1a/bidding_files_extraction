@@ -323,6 +323,7 @@ def normalize_cover_text_for_parse(text: str) -> str:
         "健设": "建设",
         "高标准农日": "高标准农田",
         "高标淮农田": "高标准农田",
+        "注苏": "江苏",
     }
     for wrong, right in replacements.items():
         normalized = normalized.replace(wrong, right)

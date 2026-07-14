@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bidding_ocr.models import OCRLine, PageText, ProcessingConfig
+from bidding_ocr.pdf_engine import RapidOCRBackend
 from bidding_ocr.pipeline import process_pdf_tree
 
 
@@ -182,6 +183,25 @@ class PipelineIntegrationTests(unittest.TestCase):
 
             self.assertEqual(summary.total_files, 2)
             self.assertEqual(FakePDFTextEngine.received_ocr_backends, [shared_backend, shared_backend])
+
+    def test_process_tree_uses_rapidocr_backend_by_default(self) -> None:
+        """
+        【方法功能】验证未注入 OCR 后端时统一入口创建并传递 RapidOCR 后端。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 10:30:00
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "pdf_files" / "bid_announcement"
+            input_dir.mkdir(parents=True)
+            (input_dir / "announcement.pdf").write_bytes(b"fake-pdf")
+            FakePDFTextEngine.received_ocr_backends = []
+            with patch("bidding_ocr.pipeline.PDFTextEngine", FakePDFTextEngine):
+                process_pdf_tree(root / "pdf_files", root / "results")
+
+            self.assertEqual(len(FakePDFTextEngine.received_ocr_backends), 1)
+            self.assertIsInstance(FakePDFTextEngine.received_ocr_backends[0], RapidOCRBackend)
 
 
 if __name__ == "__main__":

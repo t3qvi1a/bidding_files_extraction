@@ -1,21 +1,15 @@
-"""PDF 文本提取、页面渲染、PaddleOCR 与缓存适配器。"""
+"""PDF 文本提取、PDFium 渲染、RapidOCR 与缓存适配器。"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import logging
-import os
-import shutil
-import subprocess
-import tempfile
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-from PIL import Image
 
 try:
     from pypdf import PdfReader
@@ -39,9 +33,9 @@ from bidding_ocr.tender_cover_strategy import (
 from bidding_ocr.utils import is_readable_chinese_text
 
 
-logging.getLogger("pypdf").setLevel(logging.ERROR)
-
 ProgressCallback = Callable[[str], None]
+RAPIDOCR_CACHE_PROFILE = "rapidocr-v1"
+TENDER_COVER_RAPIDOCR_CACHE_PROFILE = "tender-cover-rapidocr-v1"
 
 
 class OCRBackend(ABC):
@@ -52,10 +46,10 @@ class OCRBackend(ABC):
     """
 
     @abstractmethod
-    def recognize(self, image_path: Path) -> list[OCRLine]:
+    def recognize(self, image: Any) -> list[OCRLine]:
         """
-        【方法功能】识别图片并返回带坐标的文字行。
-        :param image_path: Path+待识别页面图片
+        【方法功能】识别 RGB 图像并返回带坐标的文字行。
+        :param image: Any+待识别 RGB 图像数组
         :return: list[OCRLine]+OCR 文字行
         :Author: gexinyan
         :CreateTime: 2026-07-13 11:08:59
@@ -70,161 +64,87 @@ class OCRBackend(ABC):
         """
 
 
-class PaddleOCRBackend(OCRBackend):
+def sort_ocr_lines(lines: list[OCRLine]) -> list[OCRLine]:
     """
-    【类功能】延迟初始化并兼容 PaddleOCR 2.x、3.x 返回格式。
-    :Attributes:
-        _engine: Any+PaddleOCR 实例，首次识别时创建
+    【函数功能】依据纵向和横向坐标恢复 OCR 文字阅读顺序。
+    :param lines: list[OCRLine]+未排序文字行
+    :return: list[OCRLine]+排序后的文字行
     :Author: gexinyan
-    :CreateTime: 2026-07-13 11:08:59
+    :CreateTime: 2026-07-14 10:30:00
+    """
+    return sorted(lines, key=lambda line: (round(line.center_y / 8), line.center_x))
+
+
+class RapidOCRBackend(OCRBackend):
+    """
+    【类功能】延迟初始化 RapidOCR，并将识别结果转换为统一 OCR 行对象。
+    :Attributes:
+        _engine: Any+RapidOCR 实例，首次识别时创建
+    :Author: gexinyan
+    :CreateTime: 2026-07-14 10:30:00
     """
 
     def __init__(self) -> None:
         """
-        【方法功能】初始化延迟加载状态，避免普通导入时下载或加载模型。
+        【方法功能】初始化 RapidOCR 的延迟加载状态。
         :return: None
         :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
+        :CreateTime: 2026-07-14 10:30:00
         """
         self._engine: Any | None = None
 
     def _get_engine(self) -> Any:
         """
-        【方法功能】创建并缓存本地中文 PaddleOCR 引擎。
-        :return: Any+PaddleOCR 引擎实例
-        :raises RuntimeError: PaddleOCR 或 PaddlePaddle 未正确安装时触发
+        【方法功能】创建并缓存 RapidOCR ONNX Runtime 引擎。
+        :return: Any+RapidOCR 引擎实例
+        :raises RuntimeError: rapidocr-onnxruntime 未正确安装时触发
         :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
+        :CreateTime: 2026-07-14 10:30:00
         """
         if self._engine is not None:
             return self._engine
-        project_root = Path(__file__).resolve().parents[1]
-        os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(project_root / ".paddlex_cache"))
-        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-        os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
-        os.environ.setdefault("FLAGS_use_mkldnn", "0")
         try:
-            from paddleocr import PaddleOCR
+            from rapidocr_onnxruntime import RapidOCR
         except ImportError as exc:
             raise RuntimeError(
-                "缺少 PaddleOCR。请执行：python -m pip install -r requirements.txt"
+                "缺少 RapidOCR。请执行：python -m pip install -r requirements.txt"
             ) from exc
-        try:
-            self._engine = PaddleOCR(
-                lang="ch",
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-            )
-        except (TypeError, ValueError):
-            self._engine = PaddleOCR(lang="ch", use_angle_cls=False, show_log=False)
+        self._engine = RapidOCR()
         return self._engine
 
-    def recognize(self, image_path: Path) -> list[OCRLine]:
+    def recognize(self, image: Any) -> list[OCRLine]:
         """
-        【方法功能】调用 PaddleOCR 识别页面并统一不同版本的返回格式。
-        :param image_path: Path+页面 PNG 图片
+        【方法功能】调用 RapidOCR 识别 RGB 图像并转换为统一文字行。
+        :param image: Any+页面 RGB 图像数组
         :return: list[OCRLine]+按页面阅读顺序排列的 OCR 文字行
-        :raises RuntimeError: OCR 返回格式不可识别或模型执行失败时触发
+        :raises RuntimeError: OCR 未返回可解析文字时触发
         :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
+        :CreateTime: 2026-07-14 10:30:00
         """
-        engine = self._get_engine()
-        if hasattr(engine, "predict"):
-            try:
-                result = engine.predict(str(image_path))
-                lines = self._parse_modern_result(result)
-                if lines:
-                    return self._sort_lines(lines)
-            except (AttributeError, KeyError, TypeError, ValueError):
-                lines = []
-        try:
-            result = engine.ocr(str(image_path), cls=True)
-        except TypeError:
-            result = engine.ocr(str(image_path))
-        lines = self._parse_legacy_result(result)
+        result = self._get_engine()(np.asarray(image))
+        raw_items = result[0] if isinstance(result, tuple) else result
+        lines: list[OCRLine] = []
+        for item in raw_items or []:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                continue
+            box, text, score = item[0], str(item[1]).strip(), item[2]
+            if not text:
+                continue
+            bbox = np.asarray(box).tolist() if box is not None else []
+            lines.append(OCRLine(text, float(score), bbox))
         if not lines:
-            raise RuntimeError(f"PaddleOCR 未返回可解析文字：{image_path}")
-        return self._sort_lines(lines)
+            raise RuntimeError("RapidOCR 未返回可解析文字")
+        return sort_ocr_lines(lines)
 
     def prepare(self) -> None:
         """
-        【方法功能】提前检查并初始化 PaddleOCR，避免缺依赖时先执行 PDF 渲染。
+        【方法功能】提前检查并初始化 RapidOCR，避免缺依赖时先执行 PDF 渲染。
         :return: None
-        :raises RuntimeError: PaddleOCR 环境不可用时触发
+        :raises RuntimeError: RapidOCR 环境不可用时触发
         :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
+        :CreateTime: 2026-07-14 10:30:00
         """
         self._get_engine()
-
-    @staticmethod
-    def _parse_modern_result(result: Any) -> list[OCRLine]:
-        """
-        【函数功能】解析 PaddleOCR 3.x predict 接口返回数据。
-        :param result: Any+PaddleOCR 原始结果
-        :return: list[OCRLine]+标准文字行
-        :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
-        """
-        lines: list[OCRLine] = []
-        for item in result or []:
-            data = item
-            if hasattr(item, "json"):
-                data = item.json
-                if callable(data):
-                    data = data()
-            if not isinstance(data, dict):
-                continue
-            data = data.get("res", data)
-            texts = data.get("rec_texts", [])
-            scores = data.get("rec_scores", [])
-            boxes = data.get("rec_polys") or data.get("dt_polys") or []
-            for index, text in enumerate(texts):
-                confidence = float(scores[index]) if index < len(scores) else 0.0
-                bbox = boxes[index].tolist() if index < len(boxes) and hasattr(boxes[index], "tolist") else (
-                    boxes[index] if index < len(boxes) else []
-                )
-                if str(text).strip():
-                    lines.append(OCRLine(str(text).strip(), confidence, bbox))
-        return lines
-
-    @staticmethod
-    def _parse_legacy_result(result: Any) -> list[OCRLine]:
-        """
-        【函数功能】解析 PaddleOCR 2.x ocr 接口的嵌套返回数据。
-        :param result: Any+PaddleOCR 原始结果
-        :return: list[OCRLine]+标准文字行
-        :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
-        """
-        lines: list[OCRLine] = []
-        pages = result or []
-        if pages and isinstance(pages[0], list) and len(pages[0]) == 2 and isinstance(pages[0][1], tuple):
-            pages = [pages]
-        for page in pages:
-            for item in page or []:
-                if not isinstance(item, (list, tuple)) or len(item) < 2:
-                    continue
-                bbox, value = item[0], item[1]
-                if not isinstance(value, (list, tuple)) or not value:
-                    continue
-                text = str(value[0]).strip()
-                confidence = float(value[1]) if len(value) > 1 else 0.0
-                if text:
-                    lines.append(OCRLine(text, confidence, bbox or []))
-        return lines
-
-    @staticmethod
-    def _sort_lines(lines: list[OCRLine]) -> list[OCRLine]:
-        """
-        【函数功能】依据纵向和横向坐标恢复 OCR 文字阅读顺序。
-        :param lines: list[OCRLine]+未排序文字行
-        :return: list[OCRLine]+排序后的文字行
-        :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
-        """
-        return sorted(lines, key=lambda line: (round(line.center_y / 8), line.center_x))
-
 
 class PDFTextEngine:
     """
@@ -251,7 +171,7 @@ class PDFTextEngine:
         :param pdf_path: Path+PDF 文件路径
         :param cache_dir: Path+OCR 缓存根目录
         :param config: ProcessingConfig+处理配置
-        :param ocr_backend: OCRBackend|None+可注入的 OCR 后端（默认PaddleOCR）
+        :param ocr_backend: OCRBackend|None+可注入的 OCR 后端（默认RapidOCR）
         :param progress_callback: ProgressCallback|None+可选 OCR 进度消息回调（默认不输出）
         :return: None
         :Author: gexinyan
@@ -260,7 +180,7 @@ class PDFTextEngine:
         self.pdf_path = pdf_path
         self.cache_dir = cache_dir
         self.config = config
-        self.ocr_backend = ocr_backend or PaddleOCRBackend()
+        self.ocr_backend = ocr_backend or RapidOCRBackend()
         self.progress_callback = progress_callback
         if PdfReader is not None:
             self.reader = PdfReader(str(pdf_path), strict=False)
@@ -271,6 +191,7 @@ class PDFTextEngine:
         else:
             raise RuntimeError("缺少 PDF 读取依赖，请安装 pypdf 或 pypdfium2。")
         self._file_hash: str | None = None
+        self._render_document: Any | None = None
         self.ocr_pages: set[int] = set()
 
     @property
@@ -369,16 +290,14 @@ class PDFTextEngine:
             return PageText(page_number, "\n".join(line.text for line in lines), lines, "text", 0)
 
         actual_dpi = dpi or self.config.dpi
-        cached = self._read_cache(page_number, actual_dpi)
+        cached = self._read_cache(page_number, actual_dpi, RAPIDOCR_CACHE_PROFILE)
         if cached is not None and not self.config.force_ocr:
             self.ocr_pages.add(page_number)
             return cached
 
         self.ocr_backend.prepare()
-        with tempfile.TemporaryDirectory(prefix="bidding_ocr_") as temp_dir:
-            image_path = Path(temp_dir) / f"page-{page_number}.png"
-            self._render_page(page_number, actual_dpi, image_path)
-            lines = self.ocr_backend.recognize(image_path)
+        image = self._render_page_image(page_number, actual_dpi)
+        lines = self.ocr_backend.recognize(image)
         page = PageText(
             page_number=page_number,
             text="\n".join(line.text for line in lines),
@@ -386,7 +305,7 @@ class PDFTextEngine:
             method="ocr",
             dpi=actual_dpi,
         )
-        self._write_cache(page)
+        self._write_cache(page, RAPIDOCR_CACHE_PROFILE)
         self.ocr_pages.add(page_number)
         return page
 
@@ -409,7 +328,7 @@ class PDFTextEngine:
             return PageText(page_number, "\n".join(line.text for line in lines), lines, "text", 0)
 
         actual_dpi = dpi or self.config.dpi
-        cache_profile = "tender-cover-v4"
+        cache_profile = TENDER_COVER_RAPIDOCR_CACHE_PROFILE
         cached = self._read_cache(page_number, actual_dpi, cache_profile)
         if cached is not None and not self.config.force_ocr:
             self._emit_progress(f"封面 OCR：第{page_number}页命中缓存，跳过候选识别。")
@@ -420,45 +339,35 @@ class PDFTextEngine:
         self.ocr_backend.prepare()
         candidates: list[tuple[list[OCRLine], float]] = []
         errors: list[str] = []
-        with tempfile.TemporaryDirectory(prefix="bidding_cover_ocr_") as temp_dir:
-            temp_path = Path(temp_dir)
-            image_path = temp_path / f"page-{page_number}-{actual_dpi}.png"
-            self._render_page(page_number, actual_dpi, image_path)
-            image = np.asarray(Image.open(image_path).convert("RGB"))
+        image = self._render_page_image(page_number, actual_dpi)
+        candidates.extend(
+            self._recognize_cover_variants(
+                image,
+                include_top_crop=False,
+                retry_only=False,
+                stage_name="基础候选",
+                errors=errors,
+            )
+        )
+        best_lines, best_score = max(candidates, key=lambda item: item[1], default=([], -1.0))
+        best_text = "\n".join(line.text for line in best_lines)
+        best_average = self._average_line_confidence(best_lines)
+        if is_fragmented_cover_text(best_text, best_average):
+            retry_dpi = max(actual_dpi + 50, round(actual_dpi * 1.25))
+            self._emit_progress(
+                f"封面 OCR：基础候选质量不足，启动 {retry_dpi} DPI 定向重试（3 个候选）。"
+            )
+            retry_image = self._render_page_image(page_number, retry_dpi)
             candidates.extend(
                 self._recognize_cover_variants(
-                    image,
-                    temp_path,
-                    f"page-{page_number}-{actual_dpi}",
-                    include_top_crop=False,
-                    retry_only=False,
-                    stage_name="基础候选",
+                    retry_image,
+                    include_top_crop=True,
+                    retry_only=True,
+                    stage_name="高分辨率定向候选",
                     errors=errors,
                 )
             )
             best_lines, best_score = max(candidates, key=lambda item: item[1], default=([], -1.0))
-            best_text = "\n".join(line.text for line in best_lines)
-            best_average = self._average_line_confidence(best_lines)
-            if is_fragmented_cover_text(best_text, best_average):
-                retry_dpi = max(actual_dpi + 50, round(actual_dpi * 1.25))
-                self._emit_progress(
-                    f"封面 OCR：基础候选质量不足，启动 {retry_dpi} DPI 定向重试（3 个候选）。"
-                )
-                retry_path = temp_path / f"page-{page_number}-{retry_dpi}.png"
-                self._render_page(page_number, retry_dpi, retry_path)
-                retry_image = np.asarray(Image.open(retry_path).convert("RGB"))
-                candidates.extend(
-                    self._recognize_cover_variants(
-                        retry_image,
-                        temp_path,
-                        f"page-{page_number}-{retry_dpi}",
-                        include_top_crop=True,
-                        retry_only=True,
-                        stage_name="高分辨率定向候选",
-                        errors=errors,
-                    )
-                )
-                best_lines, best_score = max(candidates, key=lambda item: item[1], default=([], -1.0))
 
         if not best_lines:
             error_message = "；".join(errors) if errors else "OCR 未返回文字"
@@ -482,18 +391,14 @@ class PDFTextEngine:
     def _recognize_cover_variants(
         self,
         image: Any,
-        temp_dir: Path,
-        prefix: str,
         include_top_crop: bool,
         retry_only: bool,
         stage_name: str,
         errors: list[str],
     ) -> list[tuple[list[OCRLine], float]]:
         """
-        【方法功能】保存并识别一组封面图像候选，返回文字行和封面质量分。
+        【方法功能】在内存中识别一组封面图像候选，返回文字行和封面质量分。
         :param image: Any+RGB 图像数组
-        :param temp_dir: Path+候选图片临时目录
-        :param prefix: str+候选图片稳定前缀
         :param include_top_crop: bool+是否加入顶部裁剪候选
         :param retry_only: bool+是否只保留高分辨率定向裁剪候选
         :param stage_name: str+当前候选阶段名称
@@ -505,14 +410,12 @@ class PDFTextEngine:
         candidates: list[tuple[list[OCRLine], float]] = []
         variants = build_cover_image_variants(image, include_top_crop, retry_only)
         for variant_index, (variant_name, variant_image) in enumerate(variants, start=1):
-            variant_path = temp_dir / f"{prefix}-{variant_name}.png"
-            Image.fromarray(np.asarray(variant_image, dtype=np.uint8)).save(variant_path)
             self._emit_progress(
                 f"封面 OCR：{stage_name} {variant_index}/{len(variants)}（{variant_name}）开始。"
             )
             started_at = time.perf_counter()
             try:
-                lines = self.ocr_backend.recognize(variant_path)
+                lines = self.ocr_backend.recognize(variant_image)
             except Exception as exc:
                 errors.append(f"{variant_name}:{type(exc).__name__}:{exc}")
                 self._emit_progress(
@@ -593,36 +496,29 @@ class PDFTextEngine:
         scores = [line.confidence for line in lines if line.text.strip()]
         return sum(scores) / len(scores) if scores else 0.0
 
-    def _render_page(self, page_number: int, dpi: int, output_path: Path) -> None:
+    def _render_page_image(self, page_number: int, dpi: int) -> Any:
         """
-        【方法功能】使用 Poppler 将指定 PDF 页面渲染为 PNG。
+        【方法功能】使用 PDFium 将指定 PDF 页面渲染为内存 RGB 图像。
         :param page_number: int+从1开始的页码
         :param dpi: int+渲染分辨率
-        :param output_path: Path+目标 PNG 路径
-        :return: None
-        :raises RuntimeError: Poppler 不可用或渲染失败时触发
+        :return: Any+RGB uint8 图像数组
+        :raises RuntimeError: PDFium 不可用或渲染失败时触发
         :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
+        :CreateTime: 2026-07-14 10:30:00
         """
-        executable = find_pdftoppm(self.config.poppler_path)
-        prefix = output_path.with_suffix("")
-        command = [
-            str(executable),
-            "-f",
-            str(page_number),
-            "-l",
-            str(page_number),
-            "-singlefile",
-            "-png",
-            "-r",
-            str(dpi),
-            str(self.pdf_path),
-            str(prefix),
-        ]
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
-        if completed.returncode != 0 or not output_path.exists():
-            message = (completed.stderr or completed.stdout or "未知错误").strip()
-            raise RuntimeError(f"PDF 页面渲染失败：{message}")
+        if pdfium is None:
+            raise RuntimeError("缺少 pypdfium2，请执行：python -m pip install -r requirements.txt")
+        if self._render_document is None:
+            self._render_document = pdfium.PdfDocument(str(self.pdf_path))
+        page = self._render_document[page_number - 1]
+        bitmap = None
+        try:
+            bitmap = page.render(scale=max(dpi, 1) / 72.0)
+            return np.asarray(bitmap.to_pil().convert("RGB")).copy()
+        finally:
+            if bitmap is not None:
+                bitmap.close()
+            page.close()
 
     def _hash(self) -> str:
         """
@@ -691,34 +587,3 @@ class PDFTextEngine:
             ],
         }
         cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-
-
-def find_pdftoppm(configured_path: Path | None = None) -> Path:
-    """
-    【函数功能】跨平台定位 Poppler 的 pdftoppm 可执行文件。
-    :param configured_path: Path|None+用户配置的可执行文件或目录
-    :return: Path+可执行文件路径
-    :raises RuntimeError: 无法找到可执行文件时触发
-    :Author: gexinyan
-    :CreateTime: 2026-07-13 11:08:59
-    Example: find_pdftoppm()
-    """
-    candidates: list[Path] = []
-    environment_path = os.getenv("POPPLER_PATH")
-    for value in (configured_path, Path(environment_path) if environment_path else None):
-        if value is None:
-            continue
-        candidates.extend([value, value / "pdftoppm.exe", value / "pdftoppm"] if value.is_dir() else [value])
-
-    discovered = shutil.which("pdftoppm")
-    if discovered:
-        command_path = Path(discovered)
-        if command_path.suffix.lower() == ".cmd" and len(command_path.parents) >= 3:
-            candidates.append(
-                command_path.parents[2] / "native" / "poppler" / "Library" / "bin" / "pdftoppm.exe"
-            )
-        candidates.append(command_path)
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise RuntimeError("未找到 Poppler pdftoppm，请安装 Poppler 或设置 POPPLER_PATH。")

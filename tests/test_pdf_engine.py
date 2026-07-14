@@ -6,10 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 from pypdf import PdfWriter
 
 from bidding_ocr.models import OCRLine, ProcessingConfig
-from bidding_ocr.pdf_engine import OCRBackend, PDFTextEngine, PaddleOCRBackend
+from bidding_ocr.pdf_engine import OCRBackend, PDFTextEngine, RapidOCRBackend, sort_ocr_lines
 
 
 class FakeOCRBackend(OCRBackend):
@@ -30,38 +31,37 @@ class FakeOCRBackend(OCRBackend):
         """
         self.calls = 0
 
-    def recognize(self, image_path: Path) -> list[OCRLine]:
+    def recognize(self, image: np.ndarray) -> list[OCRLine]:
         """
-        【方法功能】验证测试图片存在并返回固定中文 OCR 文字。
-        :param image_path: Path+测试页面图片
+        【方法功能】验证测试图像数组并返回固定中文 OCR 文字。
+        :param image: np.ndarray+测试页面 RGB 图像
         :return: list[OCRLine]+固定识别结果
         :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
+        :CreateTime: 2026-07-14 10:30:00
         """
         self.calls += 1
-        if not image_path.exists():
-            raise AssertionError("测试页面图片不存在")
+        if not isinstance(image, np.ndarray):
+            raise AssertionError("测试页面图像未使用内存数组传递")
         return [OCRLine("项目名称：缓存测试项目", 0.99, [[0, 0], [10, 0], [10, 10], [0, 10]])]
 
 
 class StubRenderPDFTextEngine(PDFTextEngine):
     """
-    【类功能】用固定图片文件替代 Poppler 渲染，隔离测试 OCR JSON 缓存。
+    【类功能】用固定内存图像替代 PDFium 渲染，隔离测试 OCR JSON 缓存。
     :Author: gexinyan
     :CreateTime: 2026-07-13 11:08:59
     """
 
-    def _render_page(self, page_number: int, dpi: int, output_path: Path) -> None:
+    def _render_page_image(self, page_number: int, dpi: int) -> np.ndarray:
         """
-        【方法功能】写入最小测试图片占位内容以触发假 OCR 后端。
+        【方法功能】返回最小测试 RGB 图像以触发假 OCR 后端。
         :param page_number: int+页码
         :param dpi: int+渲染分辨率
-        :param output_path: Path+测试图片路径
-        :return: None
+        :return: np.ndarray+测试 RGB 图像
         :Author: gexinyan
-        :CreateTime: 2026-07-13 11:08:59
+        :CreateTime: 2026-07-14 10:30:00
         """
-        output_path.write_bytes(f"page={page_number},dpi={dpi}".encode("ascii"))
+        return np.full((10, 10, 3), 255, dtype=np.uint8)
 
 
 class PDFEngineTests(unittest.TestCase):
@@ -103,6 +103,9 @@ class PDFEngineTests(unittest.TestCase):
             self.assertEqual(first.text, second.text)
             self.assertEqual(backend.calls, 1)
             self.assertEqual(first_engine.cover_bookmark_pages(), [])
+            cache_files = list((root / "cache").rglob("*.json"))
+            self.assertEqual(len(cache_files), 1)
+            self.assertIn("rapidocr-v1", cache_files[0].name)
 
     def test_ocr_lines_are_sorted_by_rows_and_columns(self) -> None:
         """
@@ -116,8 +119,28 @@ class PDFEngineTests(unittest.TestCase):
             OCRLine("下一行", 0.9, [[0, 30], [20, 30], [20, 40], [0, 40]]),
             OCRLine("左列", 0.9, [[0, 10], [20, 10], [20, 20], [0, 20]]),
         ]
-        sorted_lines = PaddleOCRBackend._sort_lines(lines)
+        sorted_lines = sort_ocr_lines(lines)
         self.assertEqual([line.text for line in sorted_lines], ["左列", "右列", "下一行"])
+
+    def test_rapidocr_backend_converts_result_to_ocr_lines(self) -> None:
+        """
+        【方法功能】验证 RapidOCR 原始结果保留坐标、置信度并按阅读顺序转换。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 10:30:00
+        """
+        backend = RapidOCRBackend()
+        backend._engine = lambda image: (
+            [
+                [[[100, 10], [120, 10], [120, 20], [100, 20]], "右列", 0.9],
+                [[[0, 10], [20, 10], [20, 20], [0, 20]], "左列", 0.8],
+            ],
+            0.01,
+        )
+        lines = backend.recognize(np.zeros((20, 140, 3), dtype=np.uint8))
+        self.assertEqual([line.text for line in lines], ["左列", "右列"])
+        self.assertEqual(lines[0].confidence, 0.8)
+        self.assertEqual(lines[0].bbox[0], [0, 10])
 
 
 if __name__ == "__main__":

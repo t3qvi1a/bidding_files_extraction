@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 from pypdf import PdfWriter
 
 from bidding_ocr.models import OCRLine, PageText, ProcessingConfig
@@ -81,9 +80,9 @@ COVER_CASES = (
 
 class VariantOCRBackend(OCRBackend):
     """
-    【类功能】根据候选图片文件名返回不同质量文本，验证去红章候选选择。
+    【类功能】根据候选图像是否含红章返回不同质量文本，验证去红章候选选择。
     :Attributes:
-        calls: list[str]+已识别候选图片名称
+        calls: list[str]+已识别候选图像类型
     :Author: gexinyan
     :CreateTime: 2026-07-13 14:20:13
     """
@@ -97,16 +96,17 @@ class VariantOCRBackend(OCRBackend):
         """
         self.calls: list[str] = []
 
-    def recognize(self, image_path: Path) -> list[OCRLine]:
+    def recognize(self, image: np.ndarray) -> list[OCRLine]:
         """
         【方法功能】原图返回低质量文本，去红章图返回完整封面字段。
-        :param image_path: Path+候选图片路径
+        :param image: np.ndarray+候选 RGB 图像
         :return: list[OCRLine]+固定 OCR 文字行
         :Author: gexinyan
-        :CreateTime: 2026-07-13 14:20:13
+        :CreateTime: 2026-07-14 10:30:00
         """
-        self.calls.append(image_path.name)
-        if "remove_red_seal" in image_path.name:
+        contains_red_seal = bool(np.any((image[:, :, 0] > 200) & (image[:, :, 1] < 80)))
+        self.calls.append("original" if contains_red_seal else "remove_red_seal")
+        if not contains_red_seal:
             texts = [
                 "项目名称：测试高标准农田建设项目",
                 "项目编号：TEST20260001-S01",
@@ -124,19 +124,19 @@ class CoverRenderPDFTextEngine(PDFTextEngine):
     :CreateTime: 2026-07-13 14:20:13
     """
 
-    def _render_page(self, page_number: int, dpi: int, output_path: Path) -> None:
+    def _render_page_image(self, page_number: int, dpi: int) -> np.ndarray:
         """
-        【方法功能】生成包含红色区域的最小 RGB PNG 封面。
+        【方法功能】生成包含红色区域的最小 RGB 封面图像。
         :param page_number: int+页码
         :param dpi: int+渲染分辨率
-        :param output_path: Path+输出图片路径
-        :return: None
+        :return: np.ndarray+测试封面 RGB 图像
         :Author: gexinyan
-        :CreateTime: 2026-07-13 14:20:13
+        :CreateTime: 2026-07-14 10:30:00
         """
-        image = np.full((40, 40, 3), 255, dtype=np.uint8)
-        image[10:20, 10:20] = [220, 30, 30]
-        Image.fromarray(image).save(output_path)
+        edge = max(40, round(40 * dpi / 150))
+        image = np.full((edge, edge, 3), 255, dtype=np.uint8)
+        image[edge // 4 : edge // 2, edge // 4 : edge // 2] = [220, 30, 30]
+        return image
 
 
 class CompanyCandidateOCRBackend(OCRBackend):
@@ -146,18 +146,19 @@ class CompanyCandidateOCRBackend(OCRBackend):
     :CreateTime: 2026-07-13 15:45:00
     """
 
-    def recognize(self, image_path: Path) -> list[OCRLine]:
+    def recognize(self, image: np.ndarray) -> list[OCRLine]:
         """
-        【方法功能】按候选名称返回缺失、残缺或完整企业名称。
-        :param image_path: Path+候选图片路径
+        【方法功能】按候选图像尺寸和颜色返回缺失、残缺或完整企业名称。
+        :param image: np.ndarray+候选 RGB 图像
         :return: list[OCRLine]+模拟 OCR 行
         :Author: gexinyan
-        :CreateTime: 2026-07-13 15:45:00
+        :CreateTime: 2026-07-14 10:30:00
         """
-        if "company_crop_red_channel" in image_path.name:
+        is_gray = bool(np.array_equal(image[:, :, 0], image[:, :, 1]))
+        if is_gray and image.shape[0] <= 12:
             texts = ["参与单位江苏仪征苏中建设有限公司（盖单位章）"]
             confidence = 0.99
-        elif "-200-" in image_path.name:
+        elif image.shape[0] >= 50:
             texts = [
                 "项目名称：测试高标准农田建设项目",
                 "项目编号：TEST20260001-S01",
@@ -326,7 +327,10 @@ class TenderCoverStrategyTests(unittest.TestCase):
             self.assertIn("测试建设有限公司", first.text)
             self.assertEqual(first.text, second.text)
             self.assertEqual(len(backend.calls), 2)
-            self.assertTrue(any("remove_red_seal" in name for name in backend.calls))
+            self.assertIn("remove_red_seal", backend.calls)
+            cache_files = list((root / "cache").rglob("*.json"))
+            self.assertEqual(len(cache_files), 1)
+            self.assertIn("tender-cover-rapidocr-v1", cache_files[0].name)
 
     def test_multi_strategy_prefers_complete_company_candidate(self) -> None:
         """
