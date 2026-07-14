@@ -53,7 +53,8 @@ class TenderCoverFields:
     【类功能】保存投标文件封面的专属字段解析结果。
     :Attributes:
         project_name: str+项目名称
-        project_code: str+项目或交易编号
+        project_code: str+从标段编号拆分出的项目编号
+        lot_code: str+封面识别到的原始标段编号
         lot_name: str+中文标段名称
         company_name: str+投标或参与单位名称
     :Author: gexinyan
@@ -62,6 +63,7 @@ class TenderCoverFields:
 
     project_name: str = ""
     project_code: str = ""
+    lot_code: str = ""
     lot_name: str = ""
     company_name: str = ""
 
@@ -672,6 +674,21 @@ def extract_bid_file_section(text: str) -> str:
     return match.group(0) if match else extract_chinese_bid_section(normalized)
 
 
+def split_tender_cover_project_and_lot_code(value: str) -> tuple[str, str]:
+    """
+    【函数功能】将封面标段编号拆分为项目编号和完整标段编号。
+    :param value: str+封面提取到的标段编号
+    :return: tuple[str, str]+项目编号与标段编号；无短横线时两者相同
+    :Author: gexinyan
+    :CreateTime: 2026-07-14 12:30:00
+    Example: split_tender_cover_project_and_lot_code("WXHS20231116001-S01")
+    """
+    lot_code = clean_cell(value).upper()
+    lot_code = lot_code.replace("－", "-").replace("—", "-").replace("–", "-")
+    project_code = lot_code.split("-", maxsplit=1)[0] if "-" in lot_code else lot_code
+    return project_code, lot_code
+
+
 def extract_bid_file_title_project_name(text: str) -> str:
     """
     【函数功能】从封面标题区域提取项目名称候选。
@@ -841,7 +858,7 @@ def score_company_name_candidate(company_name: str, confidence: float) -> float:
 
 def extract_tender_cover_fields(text: str, prefer_title: bool = False) -> TenderCoverFields:
     """
-    【函数功能】统一提取投标封面的项目名称、编号、中文标段和企业名称。
+    【函数功能】统一提取投标封面的项目名称、项目编号、标段编号、中文标段和企业名称。
     :param text: str+封面全文
     :param prefer_title: bool+是否优先标题项目名称（默认False）
     :return: TenderCoverFields+封面字段结果
@@ -853,14 +870,16 @@ def extract_tender_cover_fields(text: str, prefer_title: bool = False) -> Tender
     project_name = extract_bid_file_project_name(text, prefer_title=prefer_title)
     project_name = strip_section_from_project_name(project_name, section)
     if COVER_PROJECT_CODE_RE.fullmatch(clean_cell(section)):
-        project_code = clean_cell(section)
+        project_code, lot_code = split_tender_cover_project_and_lot_code(section)
         lot_name = ""
     else:
         project_code = ""
+        lot_code = ""
         lot_name = clean_cell(section)
     return TenderCoverFields(
         project_name=project_name,
         project_code=project_code,
+        lot_code=lot_code,
         lot_name=lot_name,
         company_name=extract_company_name_candidate(text),
     )

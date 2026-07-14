@@ -175,6 +175,8 @@ class ParserTests(unittest.TestCase):
             [(record.company_name, record.award_status) for record in records],
             [("甲建设有限公司", "是"), ("乙工程有限公司", "否")],
         )
+        self.assertEqual(records[0].project_code, "ABC20260001")
+        self.assertEqual(records[0].lot_code, "ABC20260001-S01")
 
     def test_bid_candidates_prefers_inline_page_title(self) -> None:
         """
@@ -200,7 +202,8 @@ class ParserTests(unittest.TestCase):
         records = parse_bid_candidates([page], self._context("bid_candidates"))
 
         self.assertEqual(records[0].project_name, "测试农田建设项目施工")
-        self.assertEqual(records[0].project_code, "ABC20260001-S01")
+        self.assertEqual(records[0].project_code, "ABC20260001")
+        self.assertEqual(records[0].lot_code, "ABC20260001-S01")
         self.assertEqual(records[0].review_status, "通过")
 
     def test_bid_candidates_extracts_split_and_spaced_page_titles(self) -> None:
@@ -281,6 +284,30 @@ class ParserTests(unittest.TestCase):
         )
         self.assertEqual([record.award_status for record in records], ["是", "否"])
         self.assertEqual([record.rank for record in records], ["1", "2"])
+
+    def test_bid_candidates_keeps_plain_project_code_without_lot_code(self) -> None:
+        """
+        【函数功能】验证候选人公示的无标段后缀项目编号不填充标段编号。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 17:30:00
+        """
+        page = make_page(
+            1,
+            [
+                "测试农田建设项目中标候选人公示",
+                "项目编号：ABC20260001",
+                "五、所有投标人得分汇总表：",
+                "序号 投标人名称 排名",
+                "1 甲建设有限公司 1",
+                "六、拟定中标人：甲建设有限公司",
+            ],
+        )
+
+        record = parse_bid_candidates([page], self._context("bid_candidates"))[0]
+
+        self.assertEqual(record.project_code, "ABC20260001")
+        self.assertEqual(record.lot_code, "")
 
     def test_bid_candidates_missing_title_enters_review_queue(self) -> None:
         """
@@ -399,6 +426,7 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].project_name, "前洲片区生态综合整治项目（农田水利部分）水利基建项目")
         self.assertEqual(records[0].project_code, "WXHS20210908001")
+        self.assertEqual(records[0].lot_code, "WXHS20210908001-S04")
         self.assertEqual(records[0].lot_name, "前洲片区生态综合整治项目（农田水利部分）水利基建项目一标段")
         self.assertEqual(records[0].company_name, "江阴市水利工程公司")
 
@@ -557,7 +585,8 @@ class ParserTests(unittest.TestCase):
         self.assertEqual([record.company_name for record in records], ["甲建设有限公司", "乙水利工程有限公司"])
         self.assertEqual(records[0].project_name, "前洲片区生态综合整治项目（农田水利部分）水利基建项目")
         self.assertEqual(records[0].lot_name, "前洲片区生态综合整治项目（农田水利部分）水利基建项目一标段")
-        self.assertEqual(records[0].project_code, "WXHS20210908001-S04")
+        self.assertEqual(records[0].project_code, "WXHS20210908001")
+        self.assertEqual(records[0].lot_code, "WXHS20210908001-S04")
         self.assertEqual([record.award_status for record in records], ["未知", "未知"])
         self.assertEqual([record.review_status for record in records], ["通过", "通过"])
 
@@ -701,6 +730,41 @@ class MergeAndOutputTests(unittest.TestCase):
             self.assertIn("项目名称", path.read_text(encoding="utf-8-sig"))
             self.assertIn("标段编号", path.read_text(encoding="utf-8-sig"))
 
+    def test_merge_preserves_lot_code_from_bid_announcement(self) -> None:
+        """
+        【函数功能】验证最终合并保留中标公告已识别的标段编号。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 17:00:00
+        """
+        base = {
+            "project_name": "测试水利项目",
+            "project_code": "WXHS20210908001",
+            "lot_name": "测试水利项目一标段",
+            "company_name": "甲水利工程公司",
+            "award_status": "是",
+            "generated_at": "2026-07-14T17:00:00+08:00",
+        }
+        records = [
+            ExtractionRecord(
+                **base,
+                lot_code="WXHS20210908001-S04",
+                category="award_notice",
+                source_path="通知书.pdf",
+            ),
+            ExtractionRecord(
+                **base,
+                lot_code="WXHS20210908001-S04",
+                category="bid_announcement",
+                source_path="公告.pdf",
+            ),
+        ]
+
+        merged = merge_and_deduplicate(records)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].lot_code, "WXHS20210908001-S04")
+
     def test_missing_project_code_merges_with_named_record(self) -> None:
         """
         【方法功能】验证缺少项目编号的同名项目企业可归并到唯一编号记录。
@@ -730,6 +794,42 @@ class MergeAndOutputTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].project_code, "ABC20260003")
         self.assertIn("名单.pdf", merged[0].source_path)
+
+    def test_lot_codes_prevent_cross_lot_merging(self) -> None:
+        """
+        【函数功能】验证同项目同企业但不同标段编号的记录不会被错误合并。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 17:30:00
+        """
+        records = [
+            ExtractionRecord(
+                project_name="测试项目",
+                project_code="WXHS20210908001",
+                lot_code="WXHS20210908001-S04",
+                company_name="甲建设有限公司",
+                category="bid_candidates",
+                source_path="一标段.pdf",
+                generated_at="2026-07-14T17:30:00+08:00",
+            ),
+            ExtractionRecord(
+                project_name="测试项目",
+                project_code="WXHS20210908001",
+                lot_code="WXHS20210908001-S05",
+                company_name="甲建设有限公司",
+                category="bid_candidates",
+                source_path="二标段.pdf",
+                generated_at="2026-07-14T17:30:00+08:00",
+            ),
+        ]
+
+        merged = merge_and_deduplicate(records)
+
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(
+            {record.lot_code for record in merged},
+            {"WXHS20210908001-S04", "WXHS20210908001-S05"},
+        )
 
 
 if __name__ == "__main__":

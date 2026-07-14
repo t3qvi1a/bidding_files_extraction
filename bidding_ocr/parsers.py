@@ -22,6 +22,7 @@ PROJECT_CODE_LABELS = (
     "标段（包）编号",
     "交易编号",
 )
+LOT_CODE_LABELS = ("标段编号", "标段(包)编号", "标段（包）编号")
 NON_BIDDER_LABELS = ("招标人", "招标代理", "代理机构", "建设单位", "采购人", "监督部门")
 METADATA_STOP_LABELS = (
     "项目编号",
@@ -237,6 +238,23 @@ def extract_project_metadata(pages: list[PageText]) -> tuple[str, str, str]:
     return project_name, normalize_text(project_code), lot_name
 
 
+def extract_bid_announcement_lot_code(pages: list[PageText]) -> str:
+    """
+    【函数功能】从中标公告页面提取标段编号并规范化为连续编号。
+    :param pages: list[PageText]+中标公告页面
+    :return: str+标段编号，未识别时返回空字符串
+    :Author: gexinyan
+    :CreateTime: 2026-07-14 17:00:00
+    Example: extract_bid_announcement_lot_code([page])
+    """
+    lines = [line.text.strip() for page in pages for line in page.lines if line.text.strip()]
+    value = _line_value(lines, LOT_CODE_LABELS)
+    if not value:
+        return ""
+    code_match = re.search(r"[A-Za-z0-9][A-Za-z0-9_\-/]{5,}", value)
+    return code_match.group(0) if code_match else normalize_text(value)
+
+
 def _clean_project_value(value: str) -> str:
     """
     【函数功能】清理项目字段标签、公告标题后缀和异常标点。
@@ -300,11 +318,25 @@ def extract_award_notice_codes(pages: list[PageText]) -> tuple[str, str]:
             match = AWARD_NOTICE_HEADER_CODE_RE.search(normalized_line)
             if match is None:
                 continue
-            lot_code = match.group("code")
-            lot_suffix_match = AWARD_NOTICE_LOT_CODE_SUFFIX_RE.search(lot_code)
-            project_code = lot_code[: lot_suffix_match.start()] if lot_suffix_match else lot_code
-            return project_code, lot_code if lot_suffix_match else ""
+            return split_project_and_lot_code(match.group("code"))
     return "", ""
+
+
+def split_project_and_lot_code(value: str) -> tuple[str, str]:
+    """
+    【函数功能】将末尾带标段后缀的编号拆分为项目编号和完整标段编号。
+    :param value: str+原始项目、交易或标段编号
+    :return: tuple[str, str]+项目编号与完整标段编号；无标段后缀时后者为空
+    :Author: gexinyan
+    :CreateTime: 2026-07-14 17:30:00
+    Example: split_project_and_lot_code("WXHS20241212002-S01")
+    """
+    code = normalize_text(value).upper()
+    code = code.replace("－", "-").replace("—", "-").replace("–", "-")
+    suffix_match = AWARD_NOTICE_LOT_CODE_SUFFIX_RE.search(code)
+    if suffix_match is None:
+        return code, ""
+    return code[: suffix_match.start()], code
 
 
 def _project_name_without_lot_suffix(value: str) -> str:
@@ -1067,6 +1099,7 @@ def parse_tender_cover(pages: list[PageText], context: ParserContext) -> list[Ex
     for record in records:
         record.project_name = cover_fields.project_name or record.project_name
         record.project_code = cover_fields.project_code or record.project_code
+        record.lot_code = cover_fields.lot_code or record.lot_code
         if cover_fields.project_code or cover_fields.lot_name:
             record.lot_name = cover_fields.lot_name
         needs_review = (
@@ -1166,6 +1199,7 @@ def parse_bid_candidates(pages: list[PageText], context: ParserContext) -> list[
     records = _records_from_occurrences(occurrences, pages, context, statuses, ranks)
     for record in records:
         record.project_name = title_project_name
+        record.project_code, record.lot_code = split_project_and_lot_code(record.project_code)
         needs_review = (
             not title_project_name
             or not record.company_name
@@ -1220,7 +1254,11 @@ def parse_bid_announcement(pages: list[PageText], context: ParserContext) -> lis
     explicit = _explicit_company(pages, ("中标人", "中标单位"))
     occurrences = [explicit] if explicit else find_company_occurrences(pages)[:1]
     statuses = {normalize_text(item.name): "是" for item in occurrences if item}
-    return _records_from_occurrences([item for item in occurrences if item], pages, context, statuses)
+    records = _records_from_occurrences([item for item in occurrences if item], pages, context, statuses)
+    lot_code = extract_bid_announcement_lot_code(pages)
+    for record in records:
+        record.lot_code = lot_code
+    return records
 
 
 def parse_bid_list(pages: list[PageText], context: ParserContext) -> list[ExtractionRecord]:
@@ -1244,8 +1282,14 @@ def parse_bid_list(pages: list[PageText], context: ParserContext) -> list[Extrac
         context,
         force_review=requires_fallback,
     )
+    lot_code = extract_bid_announcement_lot_code(pages)
+    project_code, normalized_lot_code = split_project_and_lot_code(lot_code)
     for record in records:
         record.project_name = _project_name_without_lot_suffix(record.project_name)
+        if project_code:
+            record.project_code = project_code
+        if normalized_lot_code:
+            record.lot_code = normalized_lot_code
     return records
 
 

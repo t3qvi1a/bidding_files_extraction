@@ -19,6 +19,7 @@ from bidding_ocr.tender_cover_strategy import (
     is_valid_project_name_candidate,
     is_fragmented_cover_text,
     remove_red_seal,
+    split_tender_cover_project_and_lot_code,
     strip_bid_file_project_noise,
     suppress_red_seal_by_red_channel,
 )
@@ -35,6 +36,7 @@ COVER_CASES = (
 交易编号：HSLS2021011-01
 参与单位：江苏仪征苏中建设有限公司（盖单位章）""",
         "花苑村高标准农田建设项目(二期)施工",
+        "HSLS2021011",
         "HSLS2021011-01",
         "江苏仪征苏中建设有限公司",
         "ocr",
@@ -47,6 +49,7 @@ COVER_CASES = (
 交易编号：HSLS2021011-01
 参与单位：江苏嘉奕建设有限公司（盖单位章）""",
         "花苑村高标准农田建设项目(二期)施工",
+        "HSLS2021011",
         "HSLS2021011-01",
         "江苏嘉奕建设有限公司",
         "ocr",
@@ -59,6 +62,7 @@ COVER_CASES = (
 交易编号：HSLS2021011-01
 参与单位：无锡润华市政绿化有限公司（盖单位章）""",
         "花苑村高标准农田建设项目(二期)施工",
+        "HSLS2021011",
         "HSLS2021011-01",
         "无锡润华市政绿化有限公司",
         "ocr",
@@ -73,6 +77,7 @@ COVER_CASES = (
 投 标 人：无锡市银河建筑安装有限公司
 日期：2022年11月3日""",
         "2021年洛社镇石塘湾片区高标准农田建设项目施工",
+        "WXHS20221008001",
         "WXHS20221008001",
         "无锡市银河建筑安装有限公司",
         "text",
@@ -290,12 +295,29 @@ class TenderCoverStrategyTests(unittest.TestCase):
         :Author: gexinyan
         :CreateTime: 2026-07-13 14:20:13
         """
-        for name, text, project_name, project_code, company_name, _ in COVER_CASES:
+        for name, text, project_name, project_code, lot_code, company_name, _ in COVER_CASES:
             with self.subTest(name=name):
                 fields = extract_tender_cover_fields(text, prefer_title=name != "tender_cover_04")
                 self.assertEqual(fields.project_name, project_name)
                 self.assertEqual(fields.project_code, project_code)
+                self.assertEqual(fields.lot_code, lot_code)
                 self.assertEqual(fields.company_name, company_name)
+
+    def test_split_tender_cover_project_and_lot_code(self) -> None:
+        """
+        【方法功能】验证封面标段编号可拆出项目编号，无短横线时保留相同编号。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-14 12:30:00
+        """
+        self.assertEqual(
+            split_tender_cover_project_and_lot_code("WXHS20231116001-S01"),
+            ("WXHS20231116001", "WXHS20231116001-S01"),
+        )
+        self.assertEqual(
+            split_tender_cover_project_and_lot_code("WXHS20221008001"),
+            ("WXHS20221008001", "WXHS20221008001"),
+        )
 
     def test_strip_project_template_fragments_with_mixed_brackets(self) -> None:
         """
@@ -394,7 +416,7 @@ WXHS20240801001-S01
         :Author: gexinyan
         :CreateTime: 2026-07-13 14:20:13
         """
-        for name, text, project_name, project_code, company_name, method in COVER_CASES:
+        for name, text, project_name, project_code, lot_code, company_name, method in COVER_CASES:
             with self.subTest(name=name):
                 lines = [OCRLine(line, 0.98, []) for line in text.splitlines() if line]
                 page = PageText(1, text, lines, method, 300 if method == "ocr" else 0)
@@ -408,6 +430,7 @@ WXHS20240801001-S01
                 record = parse_tender_cover([page], context)[0]
                 self.assertEqual(record.project_name, project_name)
                 self.assertEqual(record.project_code, project_code)
+                self.assertEqual(record.lot_code, lot_code)
                 self.assertEqual(record.company_name, company_name)
                 self.assertEqual(record.category, "tender_cover")
                 self.assertEqual(record.lot_name, "")

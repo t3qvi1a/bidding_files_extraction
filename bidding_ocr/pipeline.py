@@ -490,7 +490,7 @@ def merge_key(record: ExtractionRecord) -> tuple[str, str, str, str]:
     Example: merge_key(record)
     """
     company = normalize_text(record.company_name)
-    lot = normalize_text(record.lot_name)
+    lot = normalize_text(record.lot_code or record.lot_name)
     if record.project_code:
         return "code", normalize_text(record.project_code).upper(), lot, company
     return "name", normalize_text(record.project_name), lot, company
@@ -509,6 +509,10 @@ def merge_and_deduplicate(records: list[ExtractionRecord]) -> list[ExtractionRec
         tuple[str, str, str, str],
         set[tuple[str, str, str, str]],
     ] = defaultdict(set)
+    lot_name_to_primary: dict[
+        tuple[str, str, str, str],
+        set[tuple[str, str, str, str]],
+    ] = defaultdict(set)
     for record in records:
         if not (record.project_code and record.project_name and record.company_name):
             continue
@@ -519,6 +523,14 @@ def merge_and_deduplicate(records: list[ExtractionRecord]) -> list[ExtractionRec
             normalize_text(record.company_name),
         )
         fallback_to_primary[fallback_key].add(merge_key(record))
+        if record.lot_code and record.lot_name:
+            lot_name_key = (
+                "code",
+                normalize_text(record.project_code).upper(),
+                normalize_text(record.lot_name),
+                normalize_text(record.company_name),
+            )
+            lot_name_to_primary[lot_name_key].add(merge_key(record))
 
     groups: dict[tuple[str, str, str, str], list[ExtractionRecord]] = defaultdict(list)
     for index, record in enumerate(records):
@@ -529,6 +541,18 @@ def merge_and_deduplicate(records: list[ExtractionRecord]) -> list[ExtractionRec
             code_keys = fallback_to_primary.get(key, set())
             if len(code_keys) == 1:
                 key = next(iter(code_keys))
+        elif not record.lot_code and record.lot_name:
+            lot_code_keys = lot_name_to_primary.get(
+                (
+                    "code",
+                    normalize_text(record.project_code).upper(),
+                    normalize_text(record.lot_name),
+                    normalize_text(record.company_name),
+                ),
+                set(),
+            )
+            if len(lot_code_keys) == 1:
+                key = next(iter(lot_code_keys))
         groups[key].append(record)
 
     merged: list[ExtractionRecord] = []
@@ -547,6 +571,7 @@ def merge_and_deduplicate(records: list[ExtractionRecord]) -> list[ExtractionRec
             chosen,
             project_name=_first_value(item.project_name for item in ordered),
             project_code=_first_value(item.project_code for item in ordered),
+            lot_code=_first_value(item.lot_code for item in ordered),
             lot_name=_first_value(item.lot_name for item in ordered),
             company_name=_first_value(item.company_name for item in ordered),
             category=_unique_join(item.category for item in ordered),
@@ -567,7 +592,7 @@ def merge_and_deduplicate(records: list[ExtractionRecord]) -> list[ExtractionRec
         merged,
         key=lambda item: (
             normalize_text(item.project_code or item.project_name),
-            normalize_text(item.lot_name),
+            normalize_text(item.lot_code or item.lot_name),
             normalize_text(item.company_name),
         ),
     )
