@@ -1,4 +1,5 @@
 pdf_files/
+pdf_files_simple/
 results/
 results/.ocr_cache/
 __pycache__/
