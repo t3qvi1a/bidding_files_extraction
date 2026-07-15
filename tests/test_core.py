@@ -554,6 +554,78 @@ class ParserTests(unittest.TestCase):
             [(record.company_name, record.award_status) for record in records],
             [("甲建设有限公司", "是"), ("乙工程有限公司", "否")],
         )
+        self.assertEqual(records[0].project_name, "测试农田建设项目")
+        self.assertEqual(records[0].lot_name, "测试农田建设项目")
+
+    def test_archive_falls_back_from_lot_name_to_engineering_name(self) -> None:
+        """
+        【方法功能】验证备案资料缺少标段名称时使用工程名称作为项目和标段名称。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 11:00:00
+        """
+        pages = [
+            make_page(1, ["工程名称：洛南大道南片高标准农田建设项目"]),
+            make_page(2, ["投标人名单", "甲建设有限公司"]),
+        ]
+
+        records = parse_archive_info(pages, self._context("archive_info"))
+
+        self.assertEqual(records[0].project_name, "洛南大道南片高标准农田建设项目")
+        self.assertEqual(records[0].lot_name, "洛南大道南片高标准农田建设项目")
+
+    def test_archive_uses_lot_metadata_and_splits_lot_code(self) -> None:
+        """
+        【方法功能】验证备案资料项目名称等于标段名称且标段编号可拆分。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 10:30:00
+        """
+        pages = [
+            make_page(
+                1,
+                [
+                    "项目名称：不应被备案资料解析采用的叙述文本",
+                    "标段名称：2022年洛社镇镇北村河西高标准农田建设项目施工",
+                    "项目编号：HSLS2022014-01",
+                ],
+            ),
+            make_page(2, ["投标人名单", "甲建设有限公司"]),
+        ]
+
+        records = parse_archive_info(pages, self._context("archive_info"))
+
+        self.assertEqual(records[0].project_name, "2022年洛社镇镇北村河西高标准农田建设项目施工")
+        self.assertEqual(records[0].lot_name, records[0].project_name)
+        self.assertEqual(records[0].project_code, "HSLS2022014")
+        self.assertEqual(records[0].lot_code, "HSLS2022014-01")
+
+    def test_archive_rejoins_wrapped_company_names(self) -> None:
+        """
+        【方法功能】验证备案资料名单跨 OCR 行拼接后不会产生企业名称残片。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 10:30:00
+        """
+        pages = [
+            make_page(
+                260,
+                [
+                    "招投标基本情况报告",
+                    "2、按时送达投标文件的投标人名单：",
+                    "江苏诣钦工程建设有限公司、江苏翰林工程",
+                    "建设有限公司、江苏金隆吉建设工程有限公司、",
+                    "3、开标基本情况：",
+                ],
+            )
+        ]
+
+        records = parse_archive_info(pages, self._context("archive_info"))
+        company_names = [record.company_name for record in records]
+
+        self.assertIn("江苏翰林工程建设有限公司", company_names)
+        self.assertIn("江苏金隆吉建设工程有限公司", company_names)
+        self.assertNotIn("建设有限公司", company_names)
 
     def test_bid_list_reads_only_unit_name_column_and_normalizes_metadata(self) -> None:
         """

@@ -89,6 +89,14 @@ EVALUATION_REPORT_TITLE_MARKER = "投标人排序及推荐的中标候选人"
 EVALUATION_REPORT_RECOMMENDED_MARKER = "推荐的中标候选人"
 EVALUATION_REPORT_FIRST_RANK_RE = re.compile(r"(?:第?[1一]名)")
 EVALUATION_REPORT_BASIC_INFO_MARKER = "基本情况一览表"
+ARCHIVE_PARTICIPANT_LIST_MARKERS = (
+    "按时送达投标文件的投标人名单",
+    "投标人名单",
+    "投标单位名单",
+)
+ARCHIVE_LOT_NAME_FALLBACK_LABELS = ("工程名称", "项目名称")
+ARCHIVE_LIST_SEPARATOR_RE = re.compile(r"[、，,；;]")
+ARCHIVE_SECTION_HEADING_RE = re.compile(r"^(?:[0-9一二三四五六七八九十百]+)[、.．。]")
 
 
 @dataclass(slots=True)
@@ -976,6 +984,94 @@ def _pages_with_keywords(pages: list[PageText], keywords: tuple[str, ...]) -> li
     ]
 
 
+def _archive_metadata(pages: list[PageText]) -> tuple[str, str, str, str]:
+    """
+    【函数功能】提取备案资料的标段名称及标段编号，并拆分项目编号。
+    :param pages: list[PageText]+备案资料候选页面
+    :return: tuple[str, str, str, str]+项目名称、项目编号、标段编号、标段名称
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:30:00
+    Example: _archive_metadata([page])
+    """
+    lines = [line.text.strip() for page in pages for line in page.lines if line.text.strip()]
+    lot_name = _clean_project_value(_line_value(lines, LOT_LABELS))
+    if not lot_name:
+        lot_name = _clean_project_value(_line_value(lines, ARCHIVE_LOT_NAME_FALLBACK_LABELS))
+    raw_lot_code = _line_value(lines, LOT_CODE_LABELS)
+    if not raw_lot_code:
+        # 备案材料中“项目编号”字段有时实际记录的是完整标段编号，按业务规则兜底使用。
+        raw_lot_code = _line_value(lines, PROJECT_CODE_LABELS)
+    code_match = re.search(r"[A-Za-z0-9][A-Za-z0-9_\-/－—–]{5,}", raw_lot_code)
+    normalized_lot_code = normalize_text(code_match.group(0) if code_match else raw_lot_code)
+    project_code, lot_code = split_project_and_lot_code(normalized_lot_code)
+    return lot_name, project_code, lot_code, lot_name
+
+
+def _archive_list_occurrences(pages: list[PageText]) -> list[CompanyOccurrence]:
+    """
+    【函数功能】重组备案资料投标人名单区段并提取完整企业名称。
+    :param pages: list[PageText]+备案资料候选页面
+    :return: list[CompanyOccurrence]+名单中的企业记录
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:30:00
+    Example: _archive_list_occurrences([page])
+    """
+    occurrences: list[CompanyOccurrence] = []
+    seen: set[str] = set()
+    for page in sorted(pages, key=lambda item: item.page_number):
+        collecting = False
+        content_lines: list[str] = []
+        evidence_lines: list[str] = []
+        for line in page.lines:
+            compact = compact_for_match(line.text)
+            if not collecting:
+                marker = next(
+                    (item for item in ARCHIVE_PARTICIPANT_LIST_MARKERS if item in compact),
+                    None,
+                )
+                if marker is None:
+                    continue
+                marker_position = compact.find(marker)
+                compact_line = re.sub(r"\s+", "", line.text)
+                content = compact_line[marker_position + len(marker) :]
+                collecting = True
+                if content:
+                    content_lines.append(content)
+                    evidence_lines.append(line.text.strip())
+                continue
+
+            if ARCHIVE_SECTION_HEADING_RE.match(compact):
+                break
+            content_lines.append(re.sub(r"\s+", "", line.text))
+            evidence_lines.append(line.text.strip())
+
+        if not collecting:
+            continue
+        joined = "".join(content_lines).strip(" ：:：")
+        for fragment in ARCHIVE_LIST_SEPARATOR_RE.split(joined):
+            names = extract_company_names(fragment, strict=True)
+            for name in names:
+                key = normalize_text(name)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                occurrences.append(
+                    CompanyOccurrence(
+                        name=name,
+                        page_number=page.page_number,
+                        evidence="".join(evidence_lines)[:300],
+                        confidence=min(
+                            (line.confidence for line in page.lines if line.text.strip()),
+                            default=0.0,
+                        )
+                        if page.method == "ocr"
+                        else 1.0,
+                        method=page.method,
+                    )
+                )
+    return occurrences
+
+
 def _explicit_company(
     pages: list[PageText],
     labels: tuple[str, ...],
@@ -1374,10 +1470,21 @@ def parse_archive_info(pages: list[PageText], context: ParserContext) -> list[Ex
     winner_occurrences = find_company_occurrences(winner_pages, strict_company_filter=True)
     if winner is None and winner_occurrences:
         winner = winner_occurrences[0]
-    occurrences = find_company_occurrences(
-        participant_pages + winner_pages,
-        strict_company_filter=True,
-    )
+    participant_occurrences = _archive_list_occurrences(pages)
+    if not participant_occurrences:
+        participant_occurrences = find_company_occurrences(
+            participant_pages,
+            strict_company_filter=True,
+        )
+    occurrences = participant_occurrences + ([winner] if winner else [])
+    deduplicated_occurrences: list[CompanyOccurrence] = []
+    occurrence_names: set[str] = set()
+    for occurrence in occurrences:
+        key = normalize_text(occurrence.name)
+        if key and key not in occurrence_names:
+            occurrence_names.add(key)
+            deduplicated_occurrences.append(occurrence)
+    occurrences = deduplicated_occurrences
     if winner and normalize_text(winner.name) not in {normalize_text(item.name) for item in occurrences}:
         occurrences.insert(0, winner)
     winner_name = normalize_text(winner.name) if winner else ""
@@ -1385,14 +1492,22 @@ def parse_archive_info(pages: list[PageText], context: ParserContext) -> list[Ex
     for occurrence in occurrences:
         key = normalize_text(occurrence.name)
         statuses[key] = "是" if key == winner_name else ("否" if winner_name else "未知")
-    return _records_from_occurrences(
+    records = _records_from_occurrences(
         occurrences,
         pages,
         context,
         statuses,
         unknown_requires_review=not bool(winner_name),
-        prefer_richest_metadata=True,
     )
+    project_name, project_code, lot_code, lot_name = _archive_metadata(pages)
+    for record in records:
+        record.project_name = project_name
+        record.project_code = project_code
+        record.lot_code = lot_code
+        record.lot_name = lot_name
+        if not project_name or (not project_code and not lot_code):
+            record.review_status = "待复核"
+    return records
 
 
 PARSER_REGISTRY: dict[str, Callable[[list[PageText], ParserContext], list[ExtractionRecord]]] = {
