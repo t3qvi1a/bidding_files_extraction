@@ -232,6 +232,14 @@ class ProcessSummary:
         input_dir: str+输入目录
         output_dir: str+输出目录
         files: list[FileProcessSummary]+逐文件统计
+        scanned_files: int+扫描发现的 PDF 总数
+        recognized_files: int+分类成功的 PDF 数量
+        unrecognized_files: int+未识别并跳过的 PDF 数量
+        filtered_files: int+被类别筛选排除的 PDF 数量
+        classification_failed_files: int+分类预检失败的 PDF 数量
+        category_file_counts: dict[str, int]+分类成功文件的类别计数
+        classification_errors: list[dict[str, str]]+分类预检错误明细
+        selected_categories: list[str]+本次筛选后允许处理的标准类别
     :Author: gexinyan
     :CreateTime: 2026-07-13 11:08:59
     """
@@ -241,6 +249,14 @@ class ProcessSummary:
     input_dir: str
     output_dir: str
     files: list[FileProcessSummary] = field(default_factory=list)
+    scanned_files: int = 0
+    recognized_files: int = 0
+    unrecognized_files: int = 0
+    filtered_files: int = 0
+    classification_failed_files: int = 0
+    category_file_counts: dict[str, int] = field(default_factory=dict)
+    classification_errors: list[dict[str, str]] = field(default_factory=list)
+    selected_categories: list[str] = field(default_factory=list)
 
     @property
     def total_files(self) -> int:
@@ -294,10 +310,18 @@ class ProcessSummary:
             "结束时间": self.finished_at,
             "输入目录": self.input_dir,
             "输出目录": self.output_dir,
+            "扫描PDF总数": self.scanned_files,
+            "已识别文件数": self.recognized_files,
+            "未识别跳过文件数": self.unrecognized_files,
+            "筛选排除文件数": self.filtered_files,
+            "分类预检失败文件数": self.classification_failed_files,
+            "各类别识别文件数": self.category_file_counts,
+            "本次处理类别": self.selected_categories,
             "文件总数": self.total_files,
             "记录总数": self.total_records,
             "待复核记录数": self.review_records,
             "失败文件数": self.failed_files,
+            "分类预检错误": self.classification_errors,
             "文件": [asdict(item) for item in self.files],
         }
 

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
+
+from pypdf import PdfReader
 
 from bidding_ocr.models import (
     CATEGORIES,
@@ -54,6 +57,137 @@ SOURCE_PRIORITY = {
 ProgressCallback = Callable[[str], None]
 
 
+def _windows_extended_path(path: Path) -> Path:
+    """
+    【函数功能】在 Windows 上为绝对路径添加长路径前缀，其他平台保持不变。
+    :param path: Path+待转换的绝对或相对路径
+    :return: Path+可用于长路径递归和文件读取的路径
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:12:03
+    Example: _windows_extended_path(Path("input"))
+    """
+    resolved = str(path.resolve())
+    if os.name != "nt" or resolved.startswith("\\\\?\\"):
+        return Path(resolved)
+    if resolved.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{resolved[2:]}")
+    return Path(f"\\\\?\\{resolved}")
+
+
+def discover_pdf_files(input_dir: Path) -> tuple[Path, list[Path]]:
+    """
+    【函数功能】递归发现输入目录内全部大小写扩展名 PDF，并兼容 Windows 中文超长路径。
+    :param input_dir: Path+已验证存在的输入根目录
+    :return: tuple[Path, list[Path]]+扫描根路径和稳定排序后的 PDF 路径
+    :raises OSError: 目录递归过程中存在无法读取的路径时触发
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:12:03
+    Example: discover_pdf_files(Path("input"))
+    """
+    scan_root = _windows_extended_path(input_dir)
+    pdf_paths: list[Path] = []
+
+    def raise_walk_error(error: OSError) -> None:
+        """
+        【函数功能】将目录扫描错误向上传递，防止静默漏掉 PDF 文件。
+        :param error: OSError+目录扫描异常
+        :return: None
+        :raises OSError: 始终抛出收到的目录扫描异常
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 10:12:03
+        Example: raise_walk_error(OSError("无法读取目录"))
+        """
+        raise error
+
+    for current_dir, _, file_names in os.walk(str(scan_root), onerror=raise_walk_error):
+        for file_name in file_names:
+            if Path(file_name).suffix.lower() == ".pdf":
+                pdf_paths.append(Path(current_dir) / file_name)
+    return scan_root, sorted(pdf_paths, key=lambda path: str(path).casefold())
+
+
+def _extract_first_page_native_text(reader: PdfReader) -> str:
+    """
+    【函数功能】从轻量 PDF 读取器提取首页原生文本，兼容不同 pypdf 版本。
+    :param reader: PdfReader+已打开的 PDF 读取器
+    :return: str+首页原生文本，无页面或无法提取时返回空字符串
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:12:03
+    Example: _extract_first_page_native_text(PdfReader("cover.pdf"))
+    """
+    if not reader.pages:
+        return ""
+    try:
+        return reader.pages[0].extract_text(extraction_mode="layout") or ""
+    except TypeError:
+        return reader.pages[0].extract_text() or ""
+    except Exception:
+        return ""
+
+
+def classify_pdf_for_plan(pdf_path: Path, input_root: Path) -> str:
+    """
+    【函数功能】为批处理清单分类 PDF，仅对封面名称候选读取页数及必要的首页文本。
+    :param pdf_path: Path+待分类 PDF 路径
+    :param input_root: Path+扫描使用的输入根目录
+    :return: str+标准类别或 unknown
+    :raises Exception: 封面候选 PDF 无法读取页数时透传底层异常
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:12:03
+    Example: classify_pdf_for_plan(Path("input/封面.pdf"), Path("input"))
+    """
+    normalized_stem = normalize_text(pdf_path.stem).lower()
+    if normalized_stem not in {"封面", "1"}:
+        return classify_pdf(pdf_path, input_root, page_count=0)
+
+    with pdf_path.open("rb") as stream:
+        reader = PdfReader(stream, strict=False)
+        page_count = len(reader.pages)
+        category = classify_pdf(pdf_path, input_root, page_count)
+        if category != "unknown" or normalized_stem == "封面" or not 1 <= page_count <= 3:
+            return category
+        first_page_text = _extract_first_page_native_text(reader)
+        return classify_pdf(pdf_path, input_root, page_count, first_page_text)
+
+
+def _resolve_selected_categories(
+    category_filter: str | None,
+    include_categories: Iterable[str] | None,
+    exclude_categories: Iterable[str] | None,
+) -> tuple[str, ...]:
+    """
+    【函数功能】校验单类别兼容参数与包含、排除参数，并计算本次允许处理的类别。
+    :param category_filter: str|None+旧版单类别筛选参数
+    :param include_categories: Iterable[str]|None+仅处理的类别集合
+    :param exclude_categories: Iterable[str]|None+不处理的类别集合
+    :return: tuple[str, ...]+按标准类别顺序排列的允许类别
+    :raises ValueError: 参数同时使用、列表为空或包含未知类别时触发
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:12:03
+    Example: _resolve_selected_categories(None, ("award_notice",), None)
+    """
+    active_filters = sum(
+        value is not None
+        for value in (category_filter, include_categories, exclude_categories)
+    )
+    if active_filters > 1:
+        raise ValueError("category_filter、include_categories 和 exclude_categories 不能同时使用")
+
+    if category_filter is not None:
+        include_categories = (category_filter,)
+    include_set = set(include_categories) if include_categories is not None else None
+    exclude_set = set(exclude_categories) if exclude_categories is not None else set()
+    if include_set == set():
+        raise ValueError("include_categories 不能为空")
+    unknown_categories = (include_set or set()) | exclude_set
+    unknown_categories.difference_update(CATEGORIES)
+    if unknown_categories:
+        raise ValueError(f"不支持的 PDF 类别：{', '.join(sorted(unknown_categories))}")
+    if include_set is not None:
+        return tuple(category for category in CATEGORIES if category in include_set)
+    return tuple(category for category in CATEGORIES if category not in exclude_set)
+
+
 def current_timestamp() -> str:
     """
     【函数功能】生成带本地时区的解析结果日期时间。
@@ -72,6 +206,8 @@ def process_pdf_tree(
     category_filter: str | None = None,
     progress_callback: ProgressCallback | None = None,
     ocr_backend: OCRBackend | None = None,
+    include_categories: Iterable[str] | None = None,
+    exclude_categories: Iterable[str] | None = None,
 ) -> ProcessSummary:
     """
     【函数功能】统一处理输入目录中的全部 PDF，输出分类、合并及复核结果。
@@ -81,6 +217,8 @@ def process_pdf_tree(
     :param category_filter: str|None+可选标准类别，仅处理该类别 PDF（默认处理全部）
     :param progress_callback: ProgressCallback|None+可选运行进度消息回调（默认不输出）
     :param ocr_backend: OCRBackend|None+可选共享 OCR 后端（默认本次运行创建一个 RapidOCR 后端）
+    :param include_categories: Iterable[str]|None+可选包含类别集合，仅处理这些类别
+    :param exclude_categories: Iterable[str]|None+可选排除类别集合，不处理这些类别
     :return: ProcessSummary+本次运行统计
     :raises FileNotFoundError: 输入目录不存在时触发
     :Author: gexinyan
@@ -91,8 +229,12 @@ def process_pdf_tree(
     output_path = Path(output_dir).resolve()
     if not input_path.is_dir():
         raise FileNotFoundError(f"PDF 输入目录不存在：{input_path}")
-    if category_filter is not None and category_filter not in CATEGORIES:
-        raise ValueError(f"不支持的 PDF 类别：{category_filter}")
+    selected_categories = _resolve_selected_categories(
+        category_filter,
+        include_categories,
+        exclude_categories,
+    )
+    selected_category_set = set(selected_categories)
     actual_config = config or ProcessingConfig()
     shared_ocr_backend = ocr_backend or RapidOCRBackend()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -100,15 +242,40 @@ def process_pdf_tree(
     started_at = current_timestamp()
     all_records: list[ExtractionRecord] = []
     file_summaries: list[FileProcessSummary] = []
-    all_pdf_paths = sorted(input_path.rglob("*.pdf"), key=lambda path: str(path).lower())
-    planned_categories = {
-        pdf_path: classify_pdf(pdf_path, input_path, page_count=0)
+    scan_input_path, all_pdf_paths = discover_pdf_files(input_path)
+    planned_categories: dict[Path, str] = {}
+    classification_errors: list[dict[str, str]] = []
+    unrecognized_files = 0
+    for pdf_path in all_pdf_paths:
+        classification_failed = False
+        try:
+            category = classify_pdf_for_plan(pdf_path, scan_input_path)
+        except Exception as exc:
+            category = "unknown"
+            classification_failed = True
+            classification_errors.append(
+                {
+                    "路径": str(pdf_path.relative_to(scan_input_path)),
+                    "错误": str(exc),
+                }
+            )
+        planned_categories[pdf_path] = category
+        if category == "unknown" and not classification_failed:
+            unrecognized_files += 1
+
+    recognized_paths = [
+        pdf_path
         for pdf_path in all_pdf_paths
+        if planned_categories[pdf_path] in CATEGORIES
+    ]
+    recognized_category_counts: dict[str, int] = {
+        category: sum(planned_categories[path] == category for path in recognized_paths)
+        for category in CATEGORIES
     }
     pdf_paths = [
         pdf_path
-        for pdf_path in all_pdf_paths
-        if category_filter is None or planned_categories[pdf_path] == category_filter
+        for pdf_path in recognized_paths
+        if planned_categories[pdf_path] in selected_category_set
     ]
     category_totals: dict[str, int] = defaultdict(int)
     for pdf_path in pdf_paths:
@@ -117,12 +284,15 @@ def process_pdf_tree(
     total_files = len(pdf_paths)
     _emit_progress(
         progress_callback,
-        f"发现 {total_files} 个待处理 PDF"
-        + (f"，类别筛选：{category_filter}" if category_filter else "，开始解析。"),
+        (
+            f"扫描 PDF {len(all_pdf_paths)} 个，识别 {len(recognized_paths)} 个，"
+            f"未识别跳过 {unrecognized_files} 个，分类预检失败 {len(classification_errors)} 个，"
+            f"筛选后待处理 {total_files} 个；类别：{', '.join(selected_categories) or '无'}。"
+        ),
     )
 
     for file_index, pdf_path in enumerate(pdf_paths, start=1):
-        relative_path = str(pdf_path.relative_to(input_path))
+        relative_path = str(pdf_path.relative_to(scan_input_path))
         planned_category = planned_categories[pdf_path]
         category_positions[planned_category] += 1
         category_index = category_positions[planned_category]
@@ -138,7 +308,7 @@ def process_pdf_tree(
         try:
             document, warnings = process_single_pdf(
                 pdf_path,
-                input_path,
+                scan_input_path,
                 cache_dir,
                 actual_config,
                 ocr_backend=shared_ocr_backend,
@@ -146,6 +316,7 @@ def process_pdf_tree(
                     progress_callback,
                     f"文件：{relative_path} | {message}",
                 ),
+                planned_category=planned_category,
             )
             all_records.extend(document.records)
             review_count = sum(record.review_status != "通过" for record in document.records)
@@ -212,6 +383,14 @@ def process_pdf_tree(
         input_dir=str(input_path),
         output_dir=str(output_path),
         files=file_summaries,
+        scanned_files=len(all_pdf_paths),
+        recognized_files=len(recognized_paths),
+        unrecognized_files=unrecognized_files,
+        filtered_files=len(recognized_paths) - len(pdf_paths),
+        classification_failed_files=len(classification_errors),
+        category_file_counts=recognized_category_counts,
+        classification_errors=classification_errors,
+        selected_categories=list(selected_categories),
     )
     (output_path / "run_summary.json").write_text(
         json.dumps(summary.to_dict(), ensure_ascii=False, indent=2),
@@ -261,6 +440,7 @@ def process_single_pdf(
     config: ProcessingConfig,
     ocr_backend: OCRBackend | None = None,
     progress_callback: ProgressCallback | None = None,
+    planned_category: str | None = None,
 ) -> tuple[ParsedDocument, list[str]]:
     """
     【函数功能】分类、提取页面并解析单个 PDF 文件。
@@ -270,6 +450,7 @@ def process_single_pdf(
     :param config: ProcessingConfig+处理配置
     :param ocr_backend: OCRBackend|None+可选共享 OCR 后端
     :param progress_callback: ProgressCallback|None+可选 OCR 阶段进度消息回调
+    :param planned_category: str|None+预分类清单中的类别，提供时不再重复分类
     :return: tuple[ParsedDocument, list[str]]+解析文档与页面告警列表
     :raises ValueError: 文件无法分类或未能读取任何页面时触发
     :Author: gexinyan
@@ -277,12 +458,14 @@ def process_single_pdf(
     Example: process_single_pdf(path, root, cache, config)
     """
     engine = PDFTextEngine(pdf_path, cache_dir, config, ocr_backend, progress_callback)
-    first_native = engine.native_text(1) if engine.page_count else ""
-    category = classify_pdf(pdf_path, input_root, engine.page_count, first_native)
+    category = planned_category
     warnings: list[str] = []
-    if category == "unknown":
-        first_page = engine.get_page(1, config.dpi)
-        category = classify_pdf(pdf_path, input_root, engine.page_count, first_page.text)
+    if category is None:
+        first_native = engine.native_text(1) if engine.page_count else ""
+        category = classify_pdf(pdf_path, input_root, engine.page_count, first_native)
+        if category == "unknown":
+            first_page = engine.get_page(1, config.dpi)
+            category = classify_pdf(pdf_path, input_root, engine.page_count, first_page.text)
     if category == "unknown":
         raise ValueError("无法识别 PDF 文件类别")
 

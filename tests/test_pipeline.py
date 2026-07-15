@@ -203,6 +203,68 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(len(FakePDFTextEngine.received_ocr_backends), 1)
             self.assertIsInstance(FakePDFTextEngine.received_ocr_backends[0], RapidOCRBackend)
 
+    def test_include_filter_skips_unknown_files_and_expands_summary(self) -> None:
+        """
+        【方法功能】验证包含筛选仅处理目标类别，未知文件跳过且摘要记录扫描分类统计。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 10:12:03
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            announcement_dir = root / "pdf_files" / "bid_announcement"
+            notice_dir = root / "pdf_files" / "award_notice"
+            announcement_dir.mkdir(parents=True)
+            notice_dir.mkdir(parents=True)
+            (announcement_dir / "announcement.pdf").write_bytes(b"fake-pdf")
+            (notice_dir / "notice.pdf").write_bytes(b"fake-pdf")
+            (root / "pdf_files" / "unrelated.pdf").write_bytes(b"fake-pdf")
+            output_dir = root / "results"
+
+            with patch("bidding_ocr.pipeline.PDFTextEngine", FakePDFTextEngine):
+                summary = process_pdf_tree(
+                    root / "pdf_files",
+                    output_dir,
+                    include_categories=("bid_announcement",),
+                )
+
+            self.assertEqual(summary.scanned_files, 3)
+            self.assertEqual(summary.recognized_files, 2)
+            self.assertEqual(summary.unrecognized_files, 1)
+            self.assertEqual(summary.filtered_files, 1)
+            self.assertEqual(summary.total_files, 1)
+            run_summary = json.loads((output_dir / "run_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(run_summary["扫描PDF总数"], 3)
+            self.assertEqual(run_summary["未识别跳过文件数"], 1)
+            self.assertEqual(run_summary["本次处理类别"], ["bid_announcement"])
+
+    def test_exclude_filter_processes_remaining_recognized_categories(self) -> None:
+        """
+        【方法功能】验证排除筛选跳过指定类别并处理其余已识别类别。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 10:12:03
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            announcement_dir = root / "pdf_files" / "bid_announcement"
+            notice_dir = root / "pdf_files" / "award_notice"
+            announcement_dir.mkdir(parents=True)
+            notice_dir.mkdir(parents=True)
+            (announcement_dir / "announcement.pdf").write_bytes(b"fake-pdf")
+            (notice_dir / "notice.pdf").write_bytes(b"fake-pdf")
+
+            with patch("bidding_ocr.pipeline.PDFTextEngine", FakePDFTextEngine):
+                summary = process_pdf_tree(
+                    root / "pdf_files",
+                    root / "results",
+                    exclude_categories=("award_notice",),
+                )
+
+            self.assertEqual(summary.total_files, 1)
+            self.assertEqual(summary.files[0].category, "bid_announcement")
+            self.assertEqual(summary.filtered_files, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

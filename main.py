@@ -9,6 +9,29 @@ from bidding_ocr import ProcessingConfig, process_pdf_tree
 from bidding_ocr.models import CATEGORIES
 
 
+def parse_category_list(value: str) -> tuple[str, ...]:
+    """
+    【函数功能】解析逗号分隔的 PDF 类别列表，完成去空白、去重和合法性校验。
+    :param value: str+英文或中文逗号分隔的类别文本
+    :return: tuple[str, ...]+保持输入顺序的合法类别元组
+    :raises argparse.ArgumentTypeError: 列表为空或包含未知类别时触发
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:12:03
+    Example: parse_category_list("award_notice,bid_candidates")
+    """
+    categories = tuple(
+        dict.fromkeys(item.strip() for item in value.replace("，", ",").split(",") if item.strip())
+    )
+    if not categories:
+        raise argparse.ArgumentTypeError("类别列表不能为空")
+    unknown_categories = [category for category in categories if category not in CATEGORIES]
+    if unknown_categories:
+        raise argparse.ArgumentTypeError(
+            f"不支持的 PDF 类别：{', '.join(unknown_categories)}；可选值：{', '.join(CATEGORIES)}"
+        )
+    return categories
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     """
     【函数功能】构建招投标 PDF 解析工具的命令行参数解析器。
@@ -29,10 +52,23 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ocr-threshold", type=float, default=0.80, help="OCR 复核阈值，默认：0.80")
     parser.add_argument("--force", action="store_true", help="忽略 OCR 缓存并重新识别")
-    parser.add_argument(
+    category_group = parser.add_mutually_exclusive_group()
+    category_group.add_argument(
         "--category",
         choices=CATEGORIES,
-        help="仅处理指定类别，例如：tender_cover；默认处理全部类别",
+        help="兼容旧版：仅处理一个指定类别，不能与 --include 或 --exclude 同时使用",
+    )
+    category_group.add_argument(
+        "--include",
+        type=parse_category_list,
+        metavar="类别1,类别2",
+        help="仅处理指定类别，多个类别使用逗号分隔",
+    )
+    category_group.add_argument(
+        "--exclude",
+        type=parse_category_list,
+        metavar="类别1,类别2",
+        help="排除指定类别，多个类别使用逗号分隔",
     )
     return parser
 
@@ -58,9 +94,12 @@ def main() -> int:
         config,
         category_filter=args.category,
         progress_callback=lambda message: print(message, flush=True),
+        include_categories=args.include,
+        exclude_categories=args.exclude,
     )
     print(
-        f"处理完成：文件 {summary.total_files} 个，记录 {summary.total_records} 条，"
+        f"处理完成：扫描 {summary.scanned_files} 个，识别 {summary.recognized_files} 个，"
+        f"处理 {summary.total_files} 个，记录 {summary.total_records} 条，"
         f"待复核 {summary.review_records} 条，失败 {summary.failed_files} 个。"
     )
     print(f"结果目录：{Path(args.output).resolve()}")

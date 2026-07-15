@@ -20,6 +20,32 @@ DIRECTORY_CATEGORY_ALIASES = {
     "archived_info": "archive_info",
 }
 
+FILENAME_CATEGORY_KEYWORDS = (
+    ("award_notice", ("中标通知书", "awardnotice")),
+    ("bid_announcement", ("中标人公告", "bidannouncement")),
+    ("bid_candidates", ("中标候选人", "中标公示", "bidcandidates")),
+    ("bid_evaluation_report", ("评标报告", "bidevaluationreport")),
+    ("bid_list", ("投标单位名单", "bidlist")),
+    (
+        "archive_info",
+        (
+            "备案资料",
+            "归档资料",
+            "备案材料",
+            "归档材料",
+            "备案",
+            "归档",
+            "archiveinfo",
+            "archivedinfo",
+        ),
+    ),
+)
+
+COVER_FILE_NAMES = {"封面", "1"}
+COVER_PATH_KEYWORDS = ("第一信封", "第一封信", "投标文件", "中标单位", "未中标")
+COVER_TITLE_KEYWORDS = ("投标文件", "参与文件")
+COVER_FIELD_KEYWORDS = ("项目名称", "项目编号", "投标人", "参与单位")
+
 COMPANY_PATTERN = re.compile(
     r"[\u4e00-\u9fffA-Za-z0-9（）()·&\-]{2,80}?"
     r"(?:有限责任公司|股份有限公司|集团有限公司|有限公司|工程公司|集团公司|研究院|研究所|集团|公司)"
@@ -71,7 +97,7 @@ def is_readable_chinese_text(value: str, minimum_length: int = 20) -> bool:
 
 def classify_pdf(pdf_path: Path, input_root: Path, page_count: int, first_page_text: str = "") -> str:
     """
-    【函数功能】依据目录、文件名、页数和首页标题判定 PDF 类别。
+    【函数功能】依据中文文件名、封面页数、路径语义和兼容目录判定 PDF 类别。
     :param pdf_path: Path+PDF 文件路径
     :param input_root: Path+输入根目录
     :param page_count: int+PDF 页数
@@ -81,35 +107,60 @@ def classify_pdf(pdf_path: Path, input_root: Path, page_count: int, first_page_t
     :CreateTime: 2026-07-13 11:08:59
     Example: classify_pdf(Path("pdf_files/award_notice/a.pdf"), Path("pdf_files"), 1)
     """
-    try:
-        relative_parts = pdf_path.resolve().relative_to(input_root.resolve()).parts[:-1]
-    except ValueError:
-        relative_parts = pdf_path.parts[:-1]
+    normalized_stem = normalize_text(pdf_path.stem).lower()
+    filename_target = compact_for_match(normalized_stem)
+    for category, keywords in FILENAME_CATEGORY_KEYWORDS:
+        if any(keyword in filename_target for keyword in keywords):
+            return category
+
+    relative_parts = _relative_directory_parts(pdf_path, input_root)
     for part in reversed(relative_parts):
         alias = DIRECTORY_CATEGORY_ALIASES.get(part.lower())
         if alias:
             return alias
 
-    target = compact_for_match(f"{pdf_path.stem}{first_page_text}").lower()
-    rules = (
-        ("bid_evaluation_report", ("评标报告", "bidevaluationreport")),
-        ("bid_candidates", ("中标候选人公示", "bidcandidates")),
-        ("award_notice", ("中标通知书", "交易结果通知书", "awardnotice")),
-        ("bid_announcement", ("中标人公告", "中标公告", "bidannouncement")),
-        ("bid_list", ("投标单位名单", "投标名单", "bidlist")),
-        ("archive_info", ("备案资料", "archiveinfo", "archivedinfo")),
-    )
-    for category, keywords in rules:
-        if any(keyword in target for keyword in keywords):
-            return category
-    cover_names = {"封面", "1", "1封面"}
-    if (normalize_text(pdf_path.stem) in cover_names and page_count <= 3) or any(
-        keyword in target for keyword in ("投标文件", "参与文件", "tendercover")
-    ):
+    if normalized_stem not in COVER_FILE_NAMES or not 1 <= page_count <= 3:
+        return "unknown"
+    if normalized_stem == "封面":
         return "tender_cover"
-    if re.search(r"(?:公司|研究所|研究院|集团)", pdf_path.stem):
+    if relative_parts and normalize_text(relative_parts[-1]) == "施工组织设计":
+        return "unknown"
+    normalized_path = compact_for_match("/".join(relative_parts))
+    if any(keyword in normalized_path for keyword in COVER_PATH_KEYWORDS):
         return "tender_cover"
-    return "unknown"
+    return "tender_cover" if is_tender_cover_text(first_page_text) else "unknown"
+
+
+def _relative_directory_parts(pdf_path: Path, input_root: Path) -> tuple[str, ...]:
+    """
+    【函数功能】获取 PDF 相对于输入根目录的父目录片段，兼容不同路径表示形式。
+    :param pdf_path: Path+待分类 PDF 路径
+    :param input_root: Path+输入根目录
+    :return: tuple[str, ...]+从外到内排列的相对父目录名称
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:12:03
+    Example: _relative_directory_parts(Path("input/a/b.pdf"), Path("input"))
+    """
+    try:
+        return pdf_path.resolve().relative_to(input_root.resolve()).parts[:-1]
+    except (OSError, ValueError):
+        return pdf_path.parts[:-1]
+
+
+def is_tender_cover_text(value: str) -> bool:
+    """
+    【函数功能】判断首页原生文本是否包含足以确认投标封面的标题或字段组合。
+    :param value: str+PDF 首页原生文本
+    :return: bool+是否具有投标封面特征
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:12:03
+    Example: is_tender_cover_text("投标文件\n项目名称：测试项目")
+    """
+    target = compact_for_match(value)
+    if any(keyword in target for keyword in COVER_TITLE_KEYWORDS):
+        return True
+    matched_fields = sum(keyword in target for keyword in COVER_FIELD_KEYWORDS)
+    return matched_fields >= 2
 
 
 def determine_cover_award_status(relative_path: str) -> str:
