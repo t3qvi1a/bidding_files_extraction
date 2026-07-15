@@ -204,18 +204,29 @@ def _line_value(lines: list[str], labels: tuple[str, ...]) -> str:
     return ""
 
 
-def extract_project_metadata(pages: list[PageText]) -> tuple[str, str, str]:
+def extract_project_metadata(
+    pages: list[PageText],
+    prefer_richest: bool = False,
+) -> tuple[str, str, str]:
     """
     【函数功能】从页面文本中提取项目名称、项目编号和标段名称。
     :param pages: list[PageText]+待解析页面
+    :param prefer_richest: bool+是否在多处项目字段中优先选择信息更完整的值
     :return: tuple[str, str, str]+项目名称、项目编号、标段名称
     :Author: gexinyan
-    :CreateTime: 2026-07-13 11:08:59
+    :CreateTime: 2026-07-15 10:00:00
     Example: extract_project_metadata([page])
     """
     lines = [line.text.strip() for page in pages for line in page.lines if line.text.strip()]
     project_name = _line_value(lines, PROJECT_LABELS)
     lot_name = _line_value(lines, LOT_LABELS)
+    if prefer_richest:
+        project_candidates = _line_values(lines, PROJECT_LABELS)
+        lot_candidates = _line_values(lines, LOT_LABELS)
+        if project_candidates:
+            project_name = max(project_candidates, key=len)
+        if lot_candidates:
+            lot_name = max(lot_candidates, key=len)
     project_code = _line_value(lines, PROJECT_CODE_LABELS)
     if project_code:
         code_match = re.search(r"[A-Za-z0-9][A-Za-z0-9_\-/]{5,}", project_code)
@@ -236,6 +247,33 @@ def extract_project_metadata(pages: list[PageText]) -> tuple[str, str, str]:
         if candidates:
             project_name = _clean_project_value(candidates[0])
     return project_name, normalize_text(project_code), lot_name
+
+
+def _line_values(lines: list[str], labels: tuple[str, ...]) -> list[str]:
+    """
+    【函数功能】提取页面中所有指定元数据字段值，供备案资料择优使用。
+    :param lines: list[str]+按阅读顺序排列的页面文字行
+    :param labels: tuple[str, ...]+候选字段标签
+    :return: list[str]+去除空值后的字段值
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:00:00
+    Example: _line_values(["项目名称：甲项目"], ("项目名称",))
+    """
+    values: list[str] = []
+    for index, line in enumerate(lines):
+        for label in labels:
+            label_match = re.search(_metadata_label_pattern(label), line)
+            if label_match is None:
+                continue
+            value = re.sub(r"^\s*[:：]?\s*", "", line[label_match.end() :])
+            value = _truncate_metadata_value(value).strip()
+            value = LAYOUT_MARGIN_RESIDUE_RE.sub("", value).strip()
+            if not normalize_text(value) and index + 1 < len(lines):
+                value = lines[index + 1].strip()
+            if normalize_text(value):
+                values.append(value)
+            break
+    return values
 
 
 def extract_bid_announcement_lot_code(pages: list[PageText]) -> str:
@@ -585,10 +623,14 @@ def extract_bid_candidate_title_project_name(pages: list[PageText]) -> str:
     return ""
 
 
-def find_company_occurrences(pages: list[PageText]) -> list[CompanyOccurrence]:
+def find_company_occurrences(
+    pages: list[PageText],
+    strict_company_filter: bool = False,
+) -> list[CompanyOccurrence]:
     """
     【函数功能】从页面文字行中提取投标相关企业并按首次出现顺序去重。
     :param pages: list[PageText]+待解析页面
+    :param strict_company_filter: bool+是否过滤备案资料叙述句中的伪企业名称
     :return: list[CompanyOccurrence]+企业出现列表
     :Author: gexinyan
     :CreateTime: 2026-07-13 11:08:59
@@ -603,7 +645,7 @@ def find_company_occurrences(pages: list[PageText]) -> list[CompanyOccurrence]:
                 label in compact for label in ("投标人", "中标人", "中标单位")
             ):
                 continue
-            for name in extract_company_names(line.text):
+            for name in extract_company_names(line.text, strict=strict_company_filter):
                 key = normalize_text(name)
                 if key in seen:
                     continue
@@ -934,11 +976,16 @@ def _pages_with_keywords(pages: list[PageText], keywords: tuple[str, ...]) -> li
     ]
 
 
-def _explicit_company(pages: list[PageText], labels: tuple[str, ...]) -> CompanyOccurrence | None:
+def _explicit_company(
+    pages: list[PageText],
+    labels: tuple[str, ...],
+    strict_company_filter: bool = False,
+) -> CompanyOccurrence | None:
     """
     【函数功能】优先从“中标人”等字段行或通知书冒号称呼中提取企业。
     :param pages: list[PageText]+候选页面
     :param labels: tuple[str, ...]+明确企业字段标签
+    :param strict_company_filter: bool+是否过滤叙述句中的伪企业名称
     :return: CompanyOccurrence|None+明确企业记录
     :Author: gexinyan
     :CreateTime: 2026-07-13 11:08:59
@@ -947,7 +994,7 @@ def _explicit_company(pages: list[PageText], labels: tuple[str, ...]) -> Company
     for page in pages:
         for line in page.lines:
             compact = compact_for_match(line.text)
-            names = extract_company_names(line.text)
+            names = extract_company_names(line.text, strict=strict_company_filter)
             has_explicit_label = any(compact_for_match(label) in compact for label in labels)
             if names and (has_explicit_label or line.text.rstrip().endswith((":", "："))):
                 return CompanyOccurrence(
@@ -968,6 +1015,7 @@ def _records_from_occurrences(
     rank_by_name: dict[str, str] | None = None,
     unknown_requires_review: bool = False,
     force_review: bool = False,
+    prefer_richest_metadata: bool = False,
 ) -> list[ExtractionRecord]:
     """
     【函数功能】将企业出现列表转换为统一解析记录并补齐项目信息和复核状态。
@@ -978,11 +1026,15 @@ def _records_from_occurrences(
     :param rank_by_name: dict[str, str]|None+按企业名称指定排名
     :param unknown_requires_review: bool+未知状态是否进入复核
     :param force_review: bool+是否强制将全部记录送入人工复核
+    :param prefer_richest_metadata: bool+是否优先使用信息更完整的项目字段
     :return: list[ExtractionRecord]+统一记录列表
     :Author: gexinyan
     :CreateTime: 2026-07-13 11:08:59
     """
-    project_name, project_code, lot_name = extract_project_metadata(pages)
+    project_name, project_code, lot_name = extract_project_metadata(
+        pages,
+        prefer_richest=prefer_richest_metadata,
+    )
     records: list[ExtractionRecord] = []
     status_by_name = status_by_name or {}
     rank_by_name = rank_by_name or {}
@@ -1314,11 +1366,18 @@ def parse_archive_info(pages: list[PageText], context: ParserContext) -> list[Ex
             "按时送达投标文件的投标人名单",
         ),
     )
-    winner = _explicit_company(winner_pages, ("中标人", "中标单位"))
-    winner_occurrences = find_company_occurrences(winner_pages)
+    winner = _explicit_company(
+        winner_pages,
+        ("中标人", "中标单位"),
+        strict_company_filter=True,
+    )
+    winner_occurrences = find_company_occurrences(winner_pages, strict_company_filter=True)
     if winner is None and winner_occurrences:
         winner = winner_occurrences[0]
-    occurrences = find_company_occurrences(participant_pages + winner_pages)
+    occurrences = find_company_occurrences(
+        participant_pages + winner_pages,
+        strict_company_filter=True,
+    )
     if winner and normalize_text(winner.name) not in {normalize_text(item.name) for item in occurrences}:
         occurrences.insert(0, winner)
     winner_name = normalize_text(winner.name) if winner else ""
@@ -1332,6 +1391,7 @@ def parse_archive_info(pages: list[PageText], context: ParserContext) -> list[Ex
         context,
         statuses,
         unknown_requires_review=not bool(winner_name),
+        prefer_richest_metadata=True,
     )
 
 

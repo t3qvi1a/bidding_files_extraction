@@ -145,22 +145,60 @@ def clean_company_name(value: str) -> str:
     return normalize_text(match.group(0)) if match else ""
 
 
-def extract_company_names(value: str) -> list[str]:
+def extract_company_names(value: str, strict: bool = False) -> list[str]:
     """
-    【函数功能】从一段文字中提取并按出现顺序去重企业名称。
+    【函数功能】从一段文字中提取并按出现顺序去重企业名称，可启用严格过滤。
     :param value: str+待解析文本
+    :param strict: bool+是否过滤叙述性文本中的泛化企业名称
     :return: list[str]+企业名称列表
     :Author: gexinyan
-    :CreateTime: 2026-07-13 11:08:59
+    :CreateTime: 2026-07-15 10:00:00
     Example: extract_company_names("甲有限公司、乙集团有限公司")
     """
     compact = unicodedata.normalize("NFKC", value or "").replace(" ", "")
     names: list[str] = []
     for match in COMPANY_PATTERN.finditer(compact):
         name = clean_company_name(match.group(0)) or normalize_text(match.group(0))
+        if strict:
+            name = _clean_strict_company_candidate(name)
         if name and name not in names:
             names.append(name)
     return names
+
+
+def _clean_strict_company_candidate(value: str) -> str:
+    """
+    【函数功能】清理备案资料叙述句中的伪企业名称候选。
+    :param value: str+普通企业正则提取结果
+    :return: str+可信企业名称，无法确认时返回空字符串
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:00:00
+    Example: _clean_strict_company_candidate("合同经江苏测试有限公司")
+    """
+    candidate = normalize_text(value)
+    if not candidate:
+        return ""
+
+    # 这些词通常说明企业后缀出现在合同叙述中，而不是企业字段或名单单元格中。
+    narrative_markers = ("委托", "代理的", "须在", "合同经", "依法", "协调", "见证")
+    marker_positions = [candidate.rfind(marker) for marker in narrative_markers]
+    marker_position = max(marker_positions, default=-1)
+    if marker_position >= 0:
+        candidate = candidate[marker_position + max(
+            len(marker) for marker in narrative_markers
+            if candidate.rfind(marker) == marker_position
+        ):]
+
+    generic_names = {"公司", "有限公司", "有限责任公司", "我公司", "本公司", "该公司"}
+    if candidate in generic_names:
+        return ""
+
+    company_suffixes = ("有限责任公司", "股份有限公司", "集团有限公司", "有限公司", "工程公司", "集团公司", "研究院", "研究所", "集团", "公司")
+    suffix = next((item for item in company_suffixes if candidate.endswith(item)), "")
+    prefix = candidate[: -len(suffix)] if suffix else ""
+    if len(prefix) < 2 or not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", prefix):
+        return ""
+    return candidate
 
 
 def validate_category(category: str) -> str:
