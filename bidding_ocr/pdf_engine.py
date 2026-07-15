@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -218,6 +219,58 @@ class PDFTextEngine:
         except Exception:
             return ""
 
+    def _native_positioned_fragments(self, page_number: int) -> list[OCRLine]:
+        """
+        【方法功能】通过 pypdf 文本访问器保存原生文字片段的近似坐标，供版式表格重组使用。
+        :param page_number: int+从1开始的页码
+        :return: list[OCRLine]+按原生提取顺序排列的定位文字片段
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 11:46:28
+        Example: engine._native_positioned_fragments(1)
+        """
+        if self._reader_kind != "pypdf":
+            return []
+        fragments: list[OCRLine] = []
+
+        def visitor_text(
+            text: str,
+            _cm: list[float],
+            text_matrix: list[float],
+            _font_dictionary: Any,
+            font_size: float,
+        ) -> None:
+            """
+            【函数功能】将 pypdf 回调中的文字和文本矩阵转换为统一定位片段。
+            :param text: str+当前文字片段
+            :param _cm: list[float]+当前变换矩阵，本次无需使用
+            :param text_matrix: list[float]+文字变换矩阵
+            :param _font_dictionary: Any+字体信息，本次无需使用
+            :param font_size: float+字号
+            :return: None
+            :Author: gexinyan
+            :CreateTime: 2026-07-15 11:46:28
+            """
+            cleaned = re.sub(r"\s+", " ", text or "").strip()
+            if not cleaned or len(text_matrix) < 6:
+                return
+            x = float(text_matrix[4] or 0.0)
+            y = float(text_matrix[5] or 0.0)
+            height = max(abs(float(font_size or 0.0)), 1.0)
+            width = max(len(cleaned) * height, 1.0)
+            fragments.append(
+                OCRLine(
+                    cleaned,
+                    1.0,
+                    [[x, y], [x + width, y], [x + width, y + height], [x, y + height]],
+                )
+            )
+
+        try:
+            self.reader.pages[page_number - 1].extract_text(visitor_text=visitor_text)
+        except Exception:
+            return []
+        return fragments
+
     def cover_bookmark_pages(self) -> list[int]:
         """
         【方法功能】从有效书签中查找名称含“封面”的页面。
@@ -284,8 +337,17 @@ class PDFTextEngine:
         native = self.native_text(page_number)
         if not force_ocr and is_readable_chinese_text(native):
             lines = [OCRLine(line.strip(), 1.0, []) for line in native.splitlines() if line.strip()]
+            native_fragments = self._native_positioned_fragments(page_number)
             self._emit_progress(f"页面 OCR：第{page_number}页使用原生文本层，跳过 OCR。")
-            return PageText(page_number, "\n".join(line.text for line in lines), lines, "text", 0)
+            return PageText(
+                page_number,
+                "\n".join(line.text for line in lines),
+                lines,
+                "text",
+                0,
+                native,
+                native_fragments,
+            )
 
         actual_dpi = dpi or self.config.dpi
         cached = self._read_cache(page_number, actual_dpi, RAPIDOCR_CACHE_PROFILE)
@@ -336,8 +398,17 @@ class PDFTextEngine:
         native = self.native_text(page_number)
         if not cover_text_needs_ocr(native):
             lines = [OCRLine(line.strip(), 1.0, []) for line in native.splitlines() if line.strip()]
+            native_fragments = self._native_positioned_fragments(page_number)
             self._emit_progress(f"封面 OCR：第{page_number}页使用原生文本层，跳过 OCR。")
-            return PageText(page_number, "\n".join(line.text for line in lines), lines, "text", 0)
+            return PageText(
+                page_number,
+                "\n".join(line.text for line in lines),
+                lines,
+                "text",
+                0,
+                native,
+                native_fragments,
+            )
 
         actual_dpi = dpi or self.config.dpi
         cache_profile = TENDER_COVER_RAPIDOCR_CACHE_PROFILE

@@ -82,9 +82,45 @@ BID_CANDIDATE_TITLE_CHROME = (
     "关闭",
     "用户登录",
 )
-BID_CANDIDATE_SCORE_TABLE_TITLE = "所有投标人得分汇总表"
+BID_CANDIDATE_TITLE_TRAILING_CHROME = (
+    "用户登录",
+    "交易平台",
+    "曝光台",
+    "用",
+    "户",
+    "登",
+    "录",
+    "交",
+    "易",
+    "平",
+    "台",
+    "曝",
+    "光",
+)
+BID_CANDIDATE_PRINT_TIME_RE = re.compile(
+    r"^\s*\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}\s*"
+)
+BID_CANDIDATE_COMPACT_PRINT_TIME_RE = re.compile(
+    r"^\d{4}/\d{1,2}/\d{1,2}\d{1,2}:\d{2}(?=\D|$)"
+)
+BID_CANDIDATE_TITLE_EDITION_RE = re.compile(r"^[（(]二次[）)]$")
+BID_CANDIDATE_SCORE_TABLE_TITLES = (
+    "所有投标人得分汇总表",
+    "所有投标人报价及得分情况",
+    "所有投标人投标报价及得分情况",
+)
 BID_CANDIDATE_SCORE_TABLE_COLUMN = "投标人名称"
-BID_CANDIDATE_SCORE_TABLE_STOP_RE = re.compile(r"^[六6][、.]?(?:拟定中标人|中标候选人)")
+BID_CANDIDATE_SCORE_TABLE_HEADERS = (
+    "序号",
+    BID_CANDIDATE_SCORE_TABLE_COLUMN,
+    "投标报价",
+    "得分情况",
+    "得分总计",
+    "排名",
+)
+BID_CANDIDATE_SCORE_TABLE_STOP_RE = re.compile(
+    r"^(?:[一二三四五六七八九十]+|\d+)[、.]?(?:拟定中标人|中标候选人)"
+)
 EVALUATION_REPORT_TITLE_MARKER = "投标人排序及推荐的中标候选人"
 EVALUATION_REPORT_RECOMMENDED_MARKER = "推荐的中标候选人"
 EVALUATION_REPORT_FIRST_RANK_RE = re.compile(r"(?:第?[1一]名)")
@@ -156,6 +192,23 @@ class BidListUnitColumn:
     left: float
     right: float
     content_top: float
+
+
+@dataclass(slots=True)
+class NativeScoreTableColumn:
+    """
+    【类功能】保存原生 layout 得分表名称列的字符范围和表头行位置。
+    :Attributes:
+        left: int+名称列可接受片段的最小字符位置
+        right: int+名称列可接受片段的最大字符位置
+        content_top: int+表头所在版式行号
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 11:46:28
+    """
+
+    left: int
+    right: int
+    content_top: int
 
 
 def _metadata_label_pattern(label: str) -> str:
@@ -600,6 +653,46 @@ def _is_credible_bid_candidate_title(value: str) -> bool:
     )
 
 
+def _strip_bid_candidate_print_time(value: str) -> str:
+    """
+    【函数功能】仅移除标题行开头的斜杠日期加时分格式打印时间。
+    :param value: str+标题原始文本
+    :return: str+去除严格时间前缀后的文本
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 11:46:28
+    Example: _strip_bid_candidate_print_time("2024/9/13 11:00 项目中标候选人公示")
+    """
+    cleaned = BID_CANDIDATE_PRINT_TIME_RE.sub("", value or "", count=1)
+    compact = _compact_bid_candidate_title(cleaned)
+    return BID_CANDIDATE_COMPACT_PRINT_TIME_RE.sub("", compact, count=1)
+
+
+def _bid_candidate_title_body(value: str) -> str:
+    """
+    【函数功能】从包含完整公示标记的标题文本中提取结构有效的项目名称主体。
+    :param value: str+单行或相邻行拼成的标题文本
+    :return: str+可信项目名称主体，标题结构无效时返回空字符串
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 11:46:28
+    Example: _bid_candidate_title_body("测试项目中标候选人公示（二次）")
+    """
+    compact = _strip_bid_candidate_print_time(value)
+    marker_position = compact.find(BID_CANDIDATE_TITLE_MARKER)
+    if marker_position < 0:
+        return ""
+    marker_end = marker_position + len(BID_CANDIDATE_TITLE_MARKER)
+    trailing = compact[marker_end:].strip(" ：:，,。")
+    trailing_is_structural = (
+        not trailing
+        or trailing in BID_CANDIDATE_TITLE_TRAILING_CHROME
+        or bool(BID_CANDIDATE_TITLE_EDITION_RE.fullmatch(trailing))
+    )
+    if not trailing_is_structural:
+        return ""
+    body = compact[:marker_position]
+    return body if _is_credible_bid_candidate_title(body) else ""
+
+
 def extract_bid_candidate_title_project_name(pages: list[PageText]) -> str:
     """
     【函数功能】从中标候选人公示首页标题区提取项目名称主体。
@@ -613,22 +706,54 @@ def extract_bid_candidate_title_project_name(pages: list[PageText]) -> str:
         return ""
     first_page = min(pages, key=lambda page: page.page_number)
     title_lines = [line.text for line in first_page.lines if line.text.strip()][:40]
+    project_code_indexes = [
+        index
+        for index, line in enumerate(title_lines)
+        if any(label in compact_for_match(line) for label in PROJECT_CODE_LABELS)
+    ]
+    candidates: list[tuple[str, int, int]] = []
     for index, line in enumerate(title_lines):
         compact = _compact_bid_candidate_title(line)
-        marker_position = compact.find(BID_CANDIDATE_TITLE_MARKER)
-        if marker_position < 0:
-            continue
-        marker_end = marker_position + len(BID_CANDIDATE_TITLE_MARKER)
-        if compact[marker_end:].strip(" ：:，,。"):
-            continue
-        inline_title = compact[:marker_position]
-        if _is_credible_bid_candidate_title(inline_title):
-            return inline_title
-        if marker_position == 0 and index > 0:
-            previous_title = _compact_bid_candidate_title(title_lines[index - 1])
-            if _is_credible_bid_candidate_title(previous_title):
-                return previous_title
-    return ""
+        inline_body = _bid_candidate_title_body(line)
+        if inline_body:
+            code_distance = min(
+                (abs(index - code_index) for code_index in project_code_indexes),
+                default=len(title_lines),
+            )
+            candidates.append((inline_body, 0, code_distance))
+
+        if (
+            BID_CANDIDATE_TITLE_MARKER not in compact
+            and len(compact) > 1
+            and index + 1 < len(title_lines)
+        ):
+            joined_body = _bid_candidate_title_body(f"{line}\n{title_lines[index + 1]}")
+            if joined_body:
+                code_distance = min(
+                    (abs(index - code_index) for code_index in project_code_indexes),
+                    default=len(title_lines),
+                )
+                candidates.append((joined_body, 1, code_distance))
+
+    if not candidates:
+        return ""
+
+    deduplicated: dict[str, tuple[str, int, int]] = {}
+    for candidate in candidates:
+        current = deduplicated.get(candidate[0])
+        if current is None or candidate[1:] < current[1:]:
+            deduplicated[candidate[0]] = candidate
+    unique_candidates = list(deduplicated.values())
+    without_layout_residue = [
+        candidate
+        for candidate in unique_candidates
+        if not any(
+            other[0] != candidate[0] and candidate[0].startswith(other[0])
+            for other in unique_candidates
+        )
+    ]
+    selectable = without_layout_residue or unique_candidates
+    return min(selectable, key=lambda candidate: (candidate[1], candidate[2], len(candidate[0])))[0]
 
 
 def find_company_occurrences(
@@ -856,6 +981,7 @@ def _append_bid_candidate_occurrence(
     name: str,
     page: PageText,
     evidence: str,
+    confidence: float | None = None,
 ) -> None:
     """
     【函数功能】将未重复的候选人公示表格企业加入提取结果。
@@ -864,11 +990,16 @@ def _append_bid_candidate_occurrence(
     :param name: str+待加入的企业名称
     :param page: PageText+企业所在页面
     :param evidence: str+企业名称对应的表格证据文本
+    :param confidence: float|None+企业名称片段的最低置信度，默认使用页面置信度
     :return: None
     :Author: gexinyan
     :CreateTime: 2026-07-14 14:20:00
     Example: _append_bid_candidate_occurrence([], set(), "测试建设有限公司", page, "1 测试建设有限公司")
     """
+    validated_names = extract_company_names(name, strict=True)
+    if not validated_names:
+        return
+    name = validated_names[0]
     key = normalize_text(name)
     if not key or key in seen:
         return
@@ -878,7 +1009,7 @@ def _append_bid_candidate_occurrence(
             name=name,
             page_number=page.page_number,
             evidence=evidence.strip()[:300],
-            confidence=page.confidence,
+            confidence=page.confidence if confidence is None else confidence,
             method=page.method,
         )
     )
@@ -886,18 +1017,404 @@ def _append_bid_candidate_occurrence(
 
 def _incomplete_score_table_company_fragment(line: str) -> str:
     """
-    【函数功能】从得分表换行残片中识别以“公”结尾的未完成企业名称。
+    【函数功能】从得分表换行残片中识别可与常见公司后缀续行拼接的未完成企业名称。
     :param line: str+得分表中的原始文本行
-    :return: str+待与后续“司”拼接的企业名称残片，未命中时返回空字符串
+    :return: str+待与后续公司后缀拼接的企业名称残片，未命中时返回空字符串
     :Author: gexinyan
     :CreateTime: 2026-07-14 14:20:00
     Example: _incomplete_score_table_company_fragment("如东县水利电力建筑工程有限责任公   户")
     """
+    incomplete_suffixes = ("有限责任公", "有限公", "有限", "工程", "有", "公")
     for segment in re.split(r"\s{2,}", line.strip()):
         compact = re.sub(r"^\d+\s*", "", _compact_bid_candidate_title(segment))
-        if len(compact) >= 6 and compact.endswith("公") and "公司" not in compact:
+        if (
+            len(compact) >= 6
+            and compact.endswith(incomplete_suffixes)
+            and not extract_company_names(compact, strict=True)
+        ):
             return compact
     return ""
+
+
+def _complete_score_table_company_fragment(fragment: str, line: str) -> str:
+    """
+    【函数功能】用后续文本行补齐得分表中的公司后缀拆行。
+    :param fragment: str+前一条未完成企业名称片段
+    :param line: str+后续候选文本行
+    :return: str+可通过严格企业校验的完整名称，无法补齐时返回空字符串
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 11:46:28
+    Example: _complete_score_table_company_fragment("测试建设有限", "公司")
+    """
+    compact = compact_for_match(line)
+    continuations = ("有限责任公司", "有限公司", "限公司", "公司", "司")
+    for continuation in continuations:
+        if not compact.startswith(continuation):
+            continue
+        names = extract_company_names(f"{fragment}{continuation}", strict=True)
+        if names:
+            return names[0]
+    return ""
+
+
+def _is_bid_candidate_score_table_title(value: str) -> bool:
+    """
+    【函数功能】判断文本是否包含任一受支持的候选人得分表标题。
+    :param value: str+待检查的原始标题文本
+    :return: bool+是否命中标准或报价得分表标题
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:50:36
+    Example: _is_bid_candidate_score_table_title("六、所有投标人投标报价及得分情况：")
+    """
+    compact = compact_for_match(value)
+    return any(title in compact for title in BID_CANDIDATE_SCORE_TABLE_TITLES)
+
+
+def _bid_candidate_score_header_label(line: OCRLine) -> str:
+    """
+    【函数功能】识别候选人得分表表头文字并返回规范标签。
+    :param line: OCRLine+待识别的 OCR 表头行
+    :return: str+命中的规范表头，未命中时返回空字符串
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:50:36
+    Example: _bid_candidate_score_header_label(OCRLine("投标人名称", 0.99, []))
+    """
+    compact = compact_for_match(line.text)
+    return next(
+        (label for label in BID_CANDIDATE_SCORE_TABLE_HEADERS if compact == compact_for_match(label)),
+        "",
+    )
+
+
+def _find_bid_candidate_score_company_column(
+    page: PageText,
+    minimum_y: float,
+) -> BidListUnitColumn | None:
+    """
+    【函数功能】在得分表标题下方依据相邻表头坐标定位投标人名称列。
+    :param page: PageText+候选人公示 OCR 页面
+    :param minimum_y: float+得分表标题纵坐标，仅在该位置下方查找表头
+    :return: BidListUnitColumn|None+投标人名称列范围，无法定位时返回空
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:50:36
+    Example: _find_bid_candidate_score_company_column(page, 100.0)
+    """
+    positioned_lines = [line for line in page.lines if line.bbox and line.center_y > minimum_y]
+    for company_line in positioned_lines:
+        if compact_for_match(company_line.text) != BID_CANDIDATE_SCORE_TABLE_COLUMN:
+            continue
+        row_tolerance = _line_height(company_line) * 3.0
+        row_headers = [
+            line
+            for line in positioned_lines
+            if abs(line.center_y - company_line.center_y) <= row_tolerance
+            and _bid_candidate_score_header_label(line)
+        ]
+        left_headers = [line for line in row_headers if line.center_x < company_line.center_x]
+        right_headers = [line for line in row_headers if line.center_x > company_line.center_x]
+        if not left_headers or not right_headers:
+            continue
+        previous_header = max(left_headers, key=lambda line: line.center_x)
+        next_header = min(right_headers, key=lambda line: line.center_x)
+        left = (previous_header.center_x + company_line.center_x) / 2
+        right = (company_line.center_x + next_header.center_x) / 2
+        if left < company_line.center_x < right:
+            return BidListUnitColumn(left, right, _line_bottom(company_line))
+    return None
+
+
+def _group_bid_candidate_company_lines(lines: list[OCRLine]) -> list[list[OCRLine]]:
+    """
+    【函数功能】按纵向间距将投标人名称列 OCR 片段重组为表格单元格。
+    :param lines: list[OCRLine]+同一页面投标人名称列内的文字片段
+    :return: list[list[OCRLine]]+按表格顺序排列的企业名称单元格片段组
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:50:36
+    Example: _group_bid_candidate_company_lines([first_line, suffix_line])
+    """
+    groups: list[list[OCRLine]] = []
+    for line in sorted(lines, key=lambda item: item.center_y):
+        if not groups:
+            groups.append([line])
+            continue
+        previous = groups[-1][-1]
+        join_tolerance = max(_line_height(previous), _line_height(line)) * 1.8
+        if line.center_y - previous.center_y <= join_tolerance:
+            groups[-1].append(line)
+        else:
+            groups.append([line])
+    return groups
+
+
+def _find_positioned_bid_candidate_score_table_occurrences(
+    pages: list[PageText],
+) -> tuple[list[CompanyOccurrence], bool]:
+    """
+    【函数功能】按 OCR 表格坐标重组得分表投标人名称列，兼容单元格内多行企业名称。
+    :param pages: list[PageText]+候选人公示页面
+    :return: tuple[list[CompanyOccurrence], bool]+企业记录与是否成功定位名称列
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 10:50:36
+    Example: _find_positioned_bid_candidate_score_table_occurrences([page])
+    """
+    occurrences: list[CompanyOccurrence] = []
+    seen: set[str] = set()
+    table_started = False
+    active_column: BidListUnitColumn | None = None
+    column_located = False
+
+    for page in sorted(pages, key=lambda item: item.page_number):
+        positioned_lines = sorted(
+            (line for line in page.lines if line.bbox),
+            key=lambda item: (item.center_y, item.center_x),
+        )
+        if not positioned_lines:
+            continue
+        title_y = float("-inf") if table_started else float("inf")
+        stop_y = float("inf")
+        for line in positioned_lines:
+            compact = compact_for_match(line.text)
+            if not table_started and _is_bid_candidate_score_table_title(compact):
+                table_started = True
+                title_y = line.center_y
+                continue
+            if table_started and BID_CANDIDATE_SCORE_TABLE_STOP_RE.match(compact):
+                stop_y = min(stop_y, line.center_y)
+
+        if not table_started:
+            continue
+        column = _find_bid_candidate_score_company_column(page, title_y)
+        if column is not None:
+            active_column = column
+            column_located = True
+        if active_column is None:
+            continue
+        content_top = column.content_top if column is not None else float("-inf")
+        company_lines = [
+            line
+            for line in positioned_lines
+            if content_top < line.center_y < stop_y
+            and active_column.left < line.center_x < active_column.right
+        ]
+        for group in _group_bid_candidate_company_lines(company_lines):
+            joined_name = "".join(re.sub(r"\s+", "", line.text) for line in group)
+            names = extract_company_names(joined_name, strict=True)
+            if not names:
+                continue
+            _append_bid_candidate_occurrence(
+                occurrences,
+                seen,
+                names[0],
+                page,
+                " ".join(line.text.strip() for line in group),
+                min(line.confidence for line in group),
+            )
+        if stop_y != float("inf"):
+            break
+    return occurrences, column_located
+
+
+def _find_native_score_table_column(
+    layout_lines: list[str],
+    minimum_index: int = 0,
+) -> NativeScoreTableColumn | None:
+    """
+    【函数功能】从原生版式表头确定序号、投标人名称和报价列之间的字符范围。
+    :param layout_lines: list[str]+保留前导空格的原生版式文本行
+    :param minimum_index: int+允许定位表头的最小版式行号（默认0）
+    :return: NativeScoreTableColumn|None+名称列字符范围，表头不完整时返回空
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 11:46:28
+    Example: _find_native_score_table_column(["序号  投标人名称  投标报价"])
+    """
+    for index, line in enumerate(layout_lines):
+        if index < minimum_index:
+            continue
+        if "序号" not in line or BID_CANDIDATE_SCORE_TABLE_COLUMN not in line:
+            continue
+        sequence_start = line.find("序号")
+        company_start = line.find(BID_CANDIDATE_SCORE_TABLE_COLUMN)
+        if company_start <= sequence_start:
+            continue
+        following_positions: list[int] = []
+        for nearby_line in layout_lines[max(0, index - 2) : index + 3]:
+            for label in BID_CANDIDATE_SCORE_TABLE_HEADERS:
+                if label in ("序号", BID_CANDIDATE_SCORE_TABLE_COLUMN):
+                    continue
+                position = nearby_line.find(label)
+                if position > company_start:
+                    following_positions.append(position)
+        next_column_start = min(following_positions, default=company_start + 24)
+        left = max(0, (sequence_start + len("序号") + company_start) // 2 - 1)
+        right = max(company_start + len(BID_CANDIDATE_SCORE_TABLE_COLUMN), next_column_start + 14)
+        return NativeScoreTableColumn(left, right, index)
+    return None
+
+
+def _native_layout_company_fragments(
+    line: str,
+    column: NativeScoreTableColumn,
+) -> list[str]:
+    """
+    【函数功能】按 layout 字符列从一行中筛选企业名称或后缀片段。
+    :param line: str+保留字符列空格的版式行
+    :param column: NativeScoreTableColumn+名称列范围
+    :return: list[str]+位于名称列内的中文片段
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 11:46:28
+    Example: _native_layout_company_fragments("  1  测试有限公司  100", column)
+    """
+    fragments: list[str] = []
+    for match in re.finditer(r"\S+", line):
+        text = match.group(0).strip()
+        if not re.search(r"[\u4e00-\u9fff]", text):
+            continue
+        if match.start() < column.left or match.start() > column.right:
+            continue
+        compact = compact_for_match(text)
+        if (
+            compact in BID_CANDIDATE_SCORE_TABLE_HEADERS
+            or _is_bid_candidate_score_table_title(compact)
+            or BID_CANDIDATE_SCORE_TABLE_STOP_RE.match(compact)
+        ):
+            continue
+        fragments.append(text)
+    return fragments
+
+
+def _native_fragment_y(page: PageText, value: str) -> float | None:
+    """
+    【函数功能】查找与 layout 片段匹配的原生 visitor 文字纵坐标，用作片段排序辅助。
+    :param page: PageText+包含原生定位片段的页面
+    :param value: str+待匹配的 layout 文字片段
+    :return: float|None+匹配片段纵坐标，无匹配时返回空
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 11:46:28
+    Example: _native_fragment_y(page, "测试有限公司")
+    """
+    compact_value = compact_for_match(value)
+    matched = [
+        fragment.center_y
+        for fragment in page.native_fragments
+        if compact_value
+        and (
+            compact_value == compact_for_match(fragment.text)
+            or compact_value in compact_for_match(fragment.text)
+        )
+    ]
+    return matched[0] if matched else None
+
+
+def _find_native_bid_candidate_score_table_occurrences(
+    pages: list[PageText],
+) -> tuple[list[CompanyOccurrence], bool]:
+    """
+    【函数功能】用原生 layout 字符列、visitor 纵坐标和序号锚点重组跨行企业名称。
+    :param pages: list[PageText]+候选人公示页面
+    :return: tuple[list[CompanyOccurrence], bool]+企业记录与是否成功定位原生名称列
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 11:46:28
+    Example: _find_native_bid_candidate_score_table_occurrences([page])
+    """
+    occurrences: list[CompanyOccurrence] = []
+    seen: set[str] = set()
+    table_started = False
+    active_column: NativeScoreTableColumn | None = None
+    column_located = False
+
+    for page in sorted(pages, key=lambda item: item.page_number):
+        if not page.layout_text:
+            continue
+        layout_lines = page.layout_text.splitlines()
+        title_indexes = [
+            index
+            for index, line in enumerate(layout_lines)
+            if _is_bid_candidate_score_table_title(line)
+        ]
+        if title_indexes:
+            table_started = True
+        if not table_started:
+            continue
+
+        page_column = _find_native_score_table_column(
+            layout_lines,
+            max(title_indexes) + 1 if title_indexes else 0,
+        )
+        if page_column is not None:
+            active_column = page_column
+            column_located = True
+        if active_column is None:
+            continue
+
+        content_start = (
+            page_column.content_top + 1
+            if page_column is not None
+            else 0
+        )
+        if title_indexes:
+            content_start = max(content_start, max(title_indexes) + 1)
+        stop_indexes = [
+            index
+            for index, line in enumerate(layout_lines[content_start:], content_start)
+            if BID_CANDIDATE_SCORE_TABLE_STOP_RE.match(compact_for_match(line))
+        ]
+        content_end = min(stop_indexes, default=len(layout_lines))
+        anchors = [
+            index
+            for index, line in enumerate(layout_lines[content_start:content_end], content_start)
+            if re.match(r"^\s*\d{1,3}(?:\s+|$)", line)
+        ]
+        grouped_fragments: dict[int, list[tuple[int, float | None, str]]] = {
+            anchor: [] for anchor in anchors
+        }
+        continuation_fragments = {"司", "公司", "限公司", "有限公司", "责任公司"}
+        for line_index in range(content_start, content_end):
+            fragments = _native_layout_company_fragments(
+                layout_lines[line_index],
+                active_column,
+            )
+            if not fragments or not anchors:
+                continue
+            distances = [abs(line_index - anchor) for anchor in anchors]
+            minimum_distance = min(distances)
+            nearest_indexes = [
+                index for index, distance in enumerate(distances) if distance == minimum_distance
+            ]
+            if len(nearest_indexes) == 1:
+                target_anchor = anchors[nearest_indexes[0]]
+            elif all(compact_for_match(fragment) in continuation_fragments for fragment in fragments):
+                target_anchor = anchors[nearest_indexes[0]]
+            else:
+                target_anchor = anchors[nearest_indexes[-1]]
+            grouped_fragments[target_anchor].extend(
+                (line_index, _native_fragment_y(page, fragment), fragment)
+                for fragment in fragments
+            )
+
+        for anchor in anchors:
+            positioned_fragments = grouped_fragments[anchor]
+            positioned_fragments.sort(
+                key=lambda item: (
+                    item[0],
+                    -(item[1] if item[1] is not None else float("-inf")),
+                )
+            )
+            joined = "".join(fragment for _, _, fragment in positioned_fragments)
+            names = extract_company_names(joined, strict=True)
+            if not names:
+                continue
+            evidence = " ".join(fragment for _, _, fragment in positioned_fragments)
+            _append_bid_candidate_occurrence(
+                occurrences,
+                seen,
+                names[0],
+                page,
+                evidence,
+                1.0,
+            )
+        if stop_indexes:
+            break
+    return occurrences, column_located
 
 
 def find_bid_candidate_score_table_occurrences(pages: list[PageText]) -> list[CompanyOccurrence]:
@@ -909,8 +1426,14 @@ def find_bid_candidate_score_table_occurrences(pages: list[PageText]) -> list[Co
     :CreateTime: 2026-07-14 14:20:00
     Example: find_bid_candidate_score_table_occurrences([page])
     """
-    occurrences: list[CompanyOccurrence] = []
-    seen: set[str] = set()
+    native_occurrences, native_column_located = (
+        _find_native_bid_candidate_score_table_occurrences(pages)
+    )
+    positioned_occurrences, column_located = (
+        _find_positioned_bid_candidate_score_table_occurrences(pages)
+    )
+    occurrences = native_occurrences if native_column_located else positioned_occurrences
+    seen = {normalize_text(occurrence.name) for occurrence in occurrences}
     table_started = False
     column_found = False
     pending_fragment = ""
@@ -922,7 +1445,7 @@ def find_bid_candidate_score_table_occurrences(pages: list[PageText]) -> list[Co
         for line in page.lines:
             compact = compact_for_match(line.text)
             if not table_started:
-                if BID_CANDIDATE_SCORE_TABLE_TITLE in compact:
+                if _is_bid_candidate_score_table_title(compact):
                     table_started = True
                     column_found = BID_CANDIDATE_SCORE_TABLE_COLUMN in compact
                 continue
@@ -933,19 +1456,22 @@ def find_bid_candidate_score_table_occurrences(pages: list[PageText]) -> list[Co
                     column_found = True
                 continue
 
-            names = extract_company_names(line.text)
+            names = extract_company_names(line.text, strict=True)
             for name in names:
                 _append_bid_candidate_occurrence(occurrences, seen, name, page, line.text)
 
             if pending_fragment:
                 pending_line_budget -= 1
-                if compact.startswith("司"):
-                    completed_names = extract_company_names(f"{pending_fragment}司")
-                    if completed_names and pending_page is not None:
+                completed_name = _complete_score_table_company_fragment(
+                    pending_fragment,
+                    line.text,
+                )
+                if completed_name:
+                    if pending_page is not None:
                         _append_bid_candidate_occurrence(
                             occurrences,
                             seen,
-                            completed_names[0],
+                            completed_name,
                             pending_page,
                             f"{pending_evidence} {line.text}",
                         )

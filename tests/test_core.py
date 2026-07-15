@@ -9,6 +9,8 @@ from pathlib import Path
 from bidding_ocr.models import ExtractionRecord, OCRLine, PageText
 from bidding_ocr.parsers import (
     ParserContext,
+    extract_bid_candidate_title_project_name,
+    find_bid_candidate_score_table_occurrences,
     parse_archive_info,
     parse_award_notice,
     parse_bid_announcement,
@@ -71,6 +73,38 @@ def make_positioned_page(
         for text, confidence, center_x, center_y in lines
     ]
     return PageText(page_number, "\n".join(line.text for line in ocr_lines), ocr_lines, "ocr", 300)
+
+
+def make_native_layout_page(page_number: int, layout_lines: list[str]) -> PageText:
+    """
+    【函数功能】创建同时包含原生 layout 字符列和 visitor 纵坐标片段的测试页面。
+    :param page_number: int+页码
+    :param layout_lines: list[str]+保留前导空格的原生版式文本行
+    :return: PageText+原生文本测试页面
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 11:46:28
+    Example: make_native_layout_page(1, ["    序号  投标人名称"])
+    """
+    text_lines = [line.strip() for line in layout_lines if line.strip()]
+    native_fragments = [
+        OCRLine(
+            line.strip(),
+            1.0,
+            [[0, 800 - index * 12], [10, 800 - index * 12],
+             [10, 810 - index * 12], [0, 810 - index * 12]],
+        )
+        for index, line in enumerate(layout_lines)
+        if line.strip()
+    ]
+    return PageText(
+        page_number,
+        "\n".join(text_lines),
+        [OCRLine(line, 1.0, []) for line in text_lines],
+        "text",
+        0,
+        "\n".join(layout_lines),
+        native_fragments,
+    )
 
 
 class UtilityTests(unittest.TestCase):
@@ -246,6 +280,151 @@ class ParserTests(unittest.TestCase):
                 self.assertEqual(records[0].project_name, expected_project_name)
         self.assertEqual(records[0].review_status, "通过")
 
+    def test_bid_candidate_title_rejects_single_character_prefix_and_print_time(self) -> None:
+        """
+        【方法功能】验证单字符版式行不会黏连标题且严格打印时间前缀会被移除。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 11:46:28
+        """
+        cases = (
+            (["录", "2024年洛社镇高标准农田建设项目施工中标候选人公示"],
+             "2024年洛社镇高标准农田建设项目施工"),
+            (["2024/9/13 11:00 2024年度玉祁街道水稻园区项目中标候选人公示"],
+             "2024年度玉祁街道水稻园区项目"),
+        )
+        for lines, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    extract_bid_candidate_title_project_name([make_page(1, lines)]),
+                    expected,
+                )
+
+    def test_bid_candidate_title_keeps_real_tai_and_lu_characters(self) -> None:
+        """
+        【方法功能】验证项目名称内部真实存在“台、录”时不会被内容级清理。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 11:46:28
+        """
+        page = make_page(
+            1,
+            ["档案著录平台改造项目中标候选人公示（二次）"],
+        )
+
+        self.assertEqual(
+            extract_bid_candidate_title_project_name([page]),
+            "档案著录平台改造项目",
+        )
+
+    def test_bid_candidate_title_prefers_shorter_complete_candidate(self) -> None:
+        """
+        【方法功能】验证网页侧栏单字残片污染跨行候选时优先选择完整且较短的标题。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 11:46:28
+        """
+        page = make_page(
+            1,
+            [
+                "前洲片区生态综合整治项目中标候选人公示",
+                "前洲片区生态综合整治项目台",
+                "中标候选人公示",
+                "项目编号：WXHS20260001-S01",
+            ],
+        )
+
+        self.assertEqual(
+            extract_bid_candidate_title_project_name([page]),
+            "前洲片区生态综合整治项目",
+        )
+
+    def test_native_layout_rejoins_north_qifang_four_companies(self) -> None:
+        """
+        【方法功能】验证北七房版式中有限/公司、有/限公司等拆分可重组为四家企业。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 11:46:28
+        """
+        pages = [
+            make_native_layout_page(
+                1,
+                [
+                    "五、所有投标人得分汇总表：",
+                    "    序号    投标人名称              投标报价    得分总计",
+                ],
+            ),
+            make_native_layout_page(
+                2,
+                [
+                    "    1     江阴市澄利建设有限公司       100  95",
+                    "          苏州市宏大建设工程有限",
+                    "    2                              101  94",
+                    "                 公司",
+                    "          无锡市银河建筑安装有",
+                    "    3                              102  93",
+                    "                 限公司",
+                    "          江苏滨海水利建筑工程",
+                    "    4                              103  92",
+                    "                 有限公司",
+                    "六、拟定中标人：江阴市澄利建设有限公司",
+                ],
+            ),
+        ]
+
+        occurrences = find_bid_candidate_score_table_occurrences(pages)
+
+        self.assertEqual(
+            [occurrence.name for occurrence in occurrences],
+            [
+                "江阴市澄利建设有限公司",
+                "苏州市宏大建设工程有限公司",
+                "无锡市银河建筑安装有限公司",
+                "江苏滨海水利建筑工程有限公司",
+            ],
+        )
+
+    def test_native_layout_rejoins_north_zhuang_five_companies(self) -> None:
+        """
+        【方法功能】验证北幢黄石街版式中有限公/司拆分与跨页续表可提取五家企业。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 11:46:28
+        """
+        pages = [
+            make_native_layout_page(
+                1,
+                [
+                    "六、所有投标人报价及得分情况：",
+                    "    序号    投标人名称              投标报价    得分总计",
+                ],
+            ),
+            make_native_layout_page(
+                2,
+                [
+                    "          江苏河川工程建设有限公",
+                    "    1                              100  95",
+                    "                 司",
+                    "    2     江阴市澄利建设有限公司       101  94",
+                    "          江苏舜图建设科技有限公",
+                    "    3                              102  93",
+                    "                 司",
+                    "          无锡市银河建筑安装有限",
+                    "    4                              103  92",
+                    "                 公司",
+                    "          苏州市宏大建设工程有限",
+                    "    5                              104  91",
+                    "                 公司",
+                    "七、拟定中标人：江苏河川工程建设有限公司",
+                ],
+            ),
+        ]
+
+        occurrences = find_bid_candidate_score_table_occurrences(pages)
+
+        self.assertEqual(len(occurrences), 5)
+        self.assertNotIn("有限公司", [occurrence.name for occurrence in occurrences])
+
     def test_bid_candidates_reads_only_score_table_companies(self) -> None:
         """
         【函数功能】验证候选人公示仅提取得分表企业并补齐跨行有限责任公司名称。
@@ -284,6 +463,121 @@ class ParserTests(unittest.TestCase):
         )
         self.assertEqual([record.award_status for record in records], ["是", "否"])
         self.assertEqual([record.rank for record in records], ["1", "2"])
+
+    def test_bid_candidates_rejoins_multiline_ocr_company_cells(self) -> None:
+        """
+        【函数功能】验证得分表按投标人名称列坐标重组有限、有限公和工程等多种换行形式。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 10:50:36
+        """
+        first_page = make_positioned_page(
+            1,
+            [
+                ("测试高标准农田建设项目施工中标候选人公", 0.99, 500, 40),
+                ("示交", 0.99, 500, 65),
+                ("五、所有投标人得分汇总表：", 0.99, 300, 100),
+                ("序号", 0.99, 100, 150),
+                ("投标人名称", 0.99, 300, 150),
+                ("投标报价", 0.99, 500, 150),
+                ("得分总计", 0.99, 700, 150),
+                ("1", 0.99, 100, 220),
+                ("江阴市澄利建设有限公司", 0.99, 300, 220),
+                ("2", 0.99, 100, 310),
+                ("苏州市宏大建设工程有限", 0.98, 300, 295),
+                ("公司", 0.99, 300, 330),
+                ("3", 0.99, 100, 410),
+                ("江苏千水建设有限公司", 0.99, 300, 410),
+            ],
+        )
+        second_page = make_positioned_page(
+            2,
+            [
+                ("江苏滨海水利建筑工程有", 0.98, 300, 100),
+                ("限公司", 0.99, 300, 135),
+                ("无锡市银河建筑安装有限", 0.99, 300, 230),
+                ("公司", 0.99, 300, 265),
+                ("无锡恒诚水利工程建设有", 0.99, 300, 360),
+                ("限公司", 0.99, 300, 395),
+                ("宜兴市水利工程有限公司", 0.99, 300, 490),
+                ("苏州市顺浩建设园林工程", 0.99, 300, 580),
+                ("有限公司", 0.99, 300, 615),
+                ("江苏祥通建设有限公司", 0.99, 300, 710),
+                ("六、拟定中标人：江阴市澄利建设有限公司", 0.99, 300, 800),
+            ],
+        )
+
+        records = parse_bid_candidates(
+            [first_page, second_page],
+            self._context("bid_candidates"),
+        )
+
+        self.assertEqual(
+            [record.company_name for record in records],
+            [
+                "江阴市澄利建设有限公司",
+                "苏州市宏大建设工程有限公司",
+                "江苏千水建设有限公司",
+                "江苏滨海水利建筑工程有限公司",
+                "无锡市银河建筑安装有限公司",
+                "无锡恒诚水利工程建设有限公司",
+                "宜兴市水利工程有限公司",
+                "苏州市顺浩建设园林工程有限公司",
+                "江苏祥通建设有限公司",
+            ],
+        )
+        self.assertNotIn("有限公司", [record.company_name for record in records])
+        self.assertEqual(records[0].project_name, "测试高标准农田建设项目施工")
+
+    def test_bid_candidates_accepts_quote_score_title_and_web_chrome(self) -> None:
+        """
+        【函数功能】验证报价及得分标题、网页侧栏残片和第七节停止标题均可正确处理。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 10:50:36
+        """
+        companies = [
+            "盛豪建设集团有限公司",
+            "无锡盛佳亿建设工程有限公司",
+            "江苏晨功建设工程有限公司",
+            "南通市通州水利建设工程有限公司",
+            "江苏舜图建设科技有限公司",
+            "苏州市宏大建设工程有限公司",
+            "宜兴市景河建设有限公司",
+            "江苏河川工程建设有限公司",
+            "江阴市澄利建设有限公司",
+            "江苏见龙水利建设工程有限公司",
+            "江苏卓泰水利建设有限公司",
+            "江苏造威建设有限公司",
+            "江苏迈霆建设工程有限公司",
+            "江苏港川建筑工程有限公司",
+        ]
+        pages = [
+            make_page(
+                1,
+                [
+                    "2025年度测试高标准农田建设项目施工",
+                    "中标候选人公示曝",
+                    "项目编号：WXHS20251020001-S02",
+                    "六、所有投标人投标报价及得分情况：",
+                    "序号 投标人名称 投标报价 得分总计 排名",
+                ],
+            ),
+            make_page(
+                2,
+                [
+                    *(f"{index} {company} 95.00" for index, company in enumerate(companies, 1)),
+                    "七、拟定中标人：盛豪建设集团有限公司",
+                    "招标代理：不应提取项目管理有限公司",
+                ],
+            ),
+        ]
+
+        records = parse_bid_candidates(pages, self._context("bid_candidates"))
+
+        self.assertEqual([record.company_name for record in records], companies)
+        self.assertEqual(records[0].project_name, "2025年度测试高标准农田建设项目施工")
+        self.assertNotIn("不应提取项目管理有限公司", [record.company_name for record in records])
 
     def test_bid_candidates_keeps_plain_project_code_without_lot_code(self) -> None:
         """

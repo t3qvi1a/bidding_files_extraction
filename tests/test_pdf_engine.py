@@ -150,6 +150,56 @@ class PDFEngineTests(unittest.TestCase):
             self.assertEqual(engine.native_text(1), "项目名称：版式测试项目")
             page.extract_text.assert_called_once_with(extraction_mode="layout")
 
+    def test_native_page_preserves_layout_and_visitor_coordinates(self) -> None:
+        """
+        【方法功能】验证原生页面同时保留 layout 前导空格与 visitor 文字纵坐标。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 11:46:28
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "blank.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=595, height=842)
+            with pdf_path.open("wb") as stream:
+                writer.write(stream)
+            engine = PDFTextEngine(pdf_path, root / "cache", ProcessingConfig())
+            engine.reader.stream.close()
+            mocked_page = MagicMock()
+            native_text = "项目名称：版式测试高标准农田建设项目，投标人名称：测试公司。"
+
+            def extract_text(*_args: object, **kwargs: object) -> str:
+                """
+                【函数功能】模拟 pypdf 的 layout 与 visitor_text 两种原生提取调用。
+                :param _args: object+未使用的位置参数
+                :param kwargs: object+提取模式或 visitor 回调参数
+                :return: str+可读中文原生文本
+                :Author: gexinyan
+                :CreateTime: 2026-07-15 11:46:28
+                """
+                visitor = kwargs.get("visitor_text")
+                if callable(visitor):
+                    visitor(
+                        "投标人名称",
+                        [1, 0, 0, 1, 0, 0],
+                        [1, 0, 0, 1, 20, 700],
+                        None,
+                        12,
+                    )
+                    return native_text
+                return f"    {native_text}"
+
+            mocked_page.extract_text.side_effect = extract_text
+            engine.reader = MagicMock(pages=[mocked_page])
+            engine._reader_kind = "pypdf"
+
+            page = engine.get_page(1)
+
+            self.assertEqual(page.layout_text, f"    {native_text}")
+            self.assertEqual(page.native_fragments[0].text, "投标人名称")
+            self.assertEqual(page.native_fragments[0].center_y, 706.0)
+
     def test_unreadable_native_text_falls_back_to_ocr(self) -> None:
         """
         【函数功能】验证乱码原生文本层会调用 OCR 并返回 OCR 页面。

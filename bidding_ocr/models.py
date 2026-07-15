@@ -103,6 +103,8 @@ class PageText:
         lines: list[OCRLine]+按阅读顺序排列的文字行
         method: str+文本提取方式，取值 text 或 ocr
         dpi: int+OCR 分辨率，文本层提取时为0
+        layout_text: str+保留字符列位置的原生版式文本，OCR 页面为空
+        native_fragments: list[OCRLine]+带原生纵坐标的文字片段，OCR 页面为空
     :Author: gexinyan
     :CreateTime: 2026-07-13 11:08:59
     """
@@ -112,6 +114,8 @@ class PageText:
     lines: list[OCRLine]
     method: str
     dpi: int = 0
+    layout_text: str = ""
+    native_fragments: list[OCRLine] = field(default_factory=list)
 
     @property
     def confidence(self) -> float:
