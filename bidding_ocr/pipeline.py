@@ -57,6 +57,7 @@ SOURCE_PRIORITY = {
 }
 
 ProgressCallback = Callable[[str], None]
+PdfCompletedCallback = Callable[[ParsedDocument, list[str]], None]
 _WORKER_OCR_BACKEND: OCRBackend | None = None
 
 
@@ -245,6 +246,7 @@ def process_pdf_tree(
     include_categories: Iterable[str] | None = None,
     exclude_categories: Iterable[str] | None = None,
     workers: int = 1,
+    pdf_completed_callback: PdfCompletedCallback | None = None,
 ) -> ProcessSummary:
     """
     【函数功能】统一处理输入目录中的全部 PDF，输出分类、合并及复核结果。
@@ -257,6 +259,7 @@ def process_pdf_tree(
     :param include_categories: Iterable[str]|None+可选包含类别集合，仅处理这些类别
     :param exclude_categories: Iterable[str]|None+可选排除类别集合，不处理这些类别
     :param workers: int+并行处理进程数，1表示串行（默认1）
+    :param pdf_completed_callback: PdfCompletedCallback|None+单个 PDF 解析成功后在主进程执行的回调；回调异常仅记录为告警，不中断 OCR
     :return: ProcessSummary+本次运行统计
     :raises FileNotFoundError: 输入目录不存在时触发
     :Author: gexinyan
@@ -426,6 +429,13 @@ def process_pdf_tree(
                     ),
                     planned_category=planned_category,
                 )
+                document, warnings = result
+                _notify_pdf_completed(
+                    pdf_completed_callback,
+                    document,
+                    warnings,
+                    progress_callback,
+                )
                 consume_result(file_index, pdf_path, result)
             except Exception as exc:
                 consume_result(file_index, pdf_path, None, exc)
@@ -457,7 +467,15 @@ def process_pdf_tree(
             for future in as_completed(future_indexes):
                 index = future_indexes[future]
                 try:
-                    indexed_results[index] = (future.result(), None)
+                    result = future.result()
+                    document, warnings = result
+                    _notify_pdf_completed(
+                        pdf_completed_callback,
+                        document,
+                        warnings,
+                        progress_callback,
+                    )
+                    indexed_results[index] = (result, None)
                 except Exception as exc:
                     indexed_results[index] = (None, exc)
                 _emit_progress(
@@ -498,6 +516,33 @@ def process_pdf_tree(
     )
     _emit_progress(progress_callback, f"结果已写入：{output_path}")
     return summary
+
+
+def _notify_pdf_completed(
+    callback: PdfCompletedCallback | None,
+    document: ParsedDocument,
+    warnings: list[str],
+    progress_callback: ProgressCallback | None,
+) -> None:
+    """
+    【函数功能】在主进程通知单个 PDF 已完成解析，并隔离外部回调异常。
+    :param callback: PdfCompletedCallback|None，待执行的单文件完成回调
+    :param document: ParsedDocument，已成功解析的 PDF 文档
+    :param warnings: list[str]，当前 PDF 的告警列表，回调异常会追加到此列表
+    :param progress_callback: ProgressCallback|None，可选进度消息回调
+    :return: None
+    :Author: gexinyan
+    :CreateTime: 2026-07-16 10:00:00
+    Example: _notify_pdf_completed(None, document, [], print)
+    """
+    if callback is None:
+        return
+    try:
+        callback(document, warnings)
+    except Exception as exc:  # noqa: BLE001
+        message = f"单 PDF 完成回调失败：{document.pdf_path}，原因：{exc}"
+        warnings.append(message)
+        _emit_progress(progress_callback, message)
 
 
 def _emit_progress(callback: ProgressCallback | None, message: str) -> None:

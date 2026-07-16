@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import patch
 
-from bidding_ocr.models import OCRLine, PageText, ProcessingConfig
+from bidding_ocr.models import ExtractionRecord, OCRLine, PageText, ParsedDocument, ProcessingConfig
 from bidding_ocr.pdf_engine import RapidOCRBackend
 from bidding_ocr.pipeline import process_pdf_tree
 
@@ -284,6 +285,153 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(summary.total_files, 1)
             self.assertEqual(summary.files[0].category, "bid_announcement")
             self.assertEqual(summary.filtered_files, 1)
+
+    def test_completed_callback_runs_once_for_serial_pdf(self) -> None:
+        """
+        【方法功能】验证串行模式下单个 PDF 成功解析后仅触发一次主进程回调。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-16 10:00:00
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "pdf_files" / "bid_announcement"
+            input_dir.mkdir(parents=True)
+            (input_dir / "announcement.pdf").write_bytes(b"fake-pdf")
+            callbacks: list[tuple[str, int]] = []
+
+            def on_completed(document: ParsedDocument, warnings: list[str]) -> None:
+                """
+                【函数功能】记录测试回调收到的文档信息。
+                :param document: ParsedDocument，完成解析的文档
+                :param warnings: list[str]，文档告警列表
+                :return: None
+                :Author: gexinyan
+                :CreateTime: 2026-07-16 10:00:00
+                """
+                callbacks.append((document.pdf_path.name, len(warnings)))
+
+            with patch("bidding_ocr.pipeline.PDFTextEngine", FakePDFTextEngine):
+                process_pdf_tree(
+                    root / "pdf_files",
+                    root / "results",
+                    pdf_completed_callback=on_completed,
+                )
+
+            self.assertEqual(callbacks, [("announcement.pdf", 0)])
+
+    def test_completed_callback_runs_in_parallel_result_collection(self) -> None:
+        """
+        【方法功能】验证并行分支在主进程接收结果时触发回调且保持最终汇总顺序。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-16 10:00:00
+        """
+        class ImmediateExecutor:
+            """
+            【类功能】以同步 Future 模拟多进程执行器，用于测试主进程结果收集逻辑。
+            :Author: gexinyan
+            :CreateTime: 2026-07-16 10:00:00
+            """
+
+            def __init__(self, **_: object) -> None:
+                """
+                【方法功能】初始化测试执行器。
+                :return: None
+                :Author: gexinyan
+                :CreateTime: 2026-07-16 10:00:00
+                """
+
+            def __enter__(self) -> "ImmediateExecutor":
+                """
+                【方法功能】进入测试执行器上下文。
+                :return: ImmediateExecutor，当前执行器
+                :Author: gexinyan
+                :CreateTime: 2026-07-16 10:00:00
+                """
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                """
+                【方法功能】退出测试执行器上下文。
+                :return: None
+                :Author: gexinyan
+                :CreateTime: 2026-07-16 10:00:00
+                """
+
+            def submit(self, function: object, task: object) -> Future[object]:
+                """
+                【方法功能】同步执行任务并返回已完成 Future。
+                :param function: object，待调用函数
+                :param task: object，任务参数
+                :return: Future[object]，已完成任务
+                :Author: gexinyan
+                :CreateTime: 2026-07-16 10:00:00
+                """
+                future: Future[object] = Future()
+                try:
+                    future.set_result(function(task))  # type: ignore[operator]
+                except Exception as exc:  # noqa: BLE001
+                    future.set_exception(exc)
+                return future
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "pdf_files" / "bid_announcement"
+            input_dir.mkdir(parents=True)
+            first_path = input_dir / "first.pdf"
+            second_path = input_dir / "second.pdf"
+            first_path.write_bytes(b"fake-pdf")
+            second_path.write_bytes(b"fake-pdf")
+            callbacks: list[str] = []
+
+            def build_worker_result(task: tuple[Path, Path, Path, ProcessingConfig, str]) -> tuple[ParsedDocument, list[str]]:
+                """
+                【函数功能】构造不依赖 OCR 模型的并行任务结果。
+                :param task: tuple[Path, Path, Path, ProcessingConfig, str]，模拟 worker 任务
+                :return: tuple[ParsedDocument, list[str]]，模拟解析结果
+                :Author: gexinyan
+                :CreateTime: 2026-07-16 10:00:00
+                """
+                path = task[0]
+                return (
+                    ParsedDocument(
+                        pdf_path=path,
+                        category="bid_announcement",
+                        page_count=1,
+                        records=[ExtractionRecord(company_name=path.stem, source_path=path.name)],
+                    ),
+                    [],
+                )
+
+            def on_completed(document: ParsedDocument, _: list[str]) -> None:
+                """
+                【函数功能】记录主进程回调收到的文档名。
+                :param document: ParsedDocument，完成解析的文档
+                :param _: list[str]，文档告警列表
+                :return: None
+                :Author: gexinyan
+                :CreateTime: 2026-07-16 10:00:00
+                """
+                callbacks.append(document.pdf_path.name)
+
+            with (
+                patch("bidding_ocr.pipeline.classify_pdf_for_plan", return_value="bid_announcement"),
+                patch("bidding_ocr.pipeline.ProcessPoolExecutor", ImmediateExecutor),
+                patch("bidding_ocr.pipeline._process_pdf_worker", side_effect=build_worker_result),
+            ):
+                summary = process_pdf_tree(
+                    root / "pdf_files",
+                    root / "results",
+                    workers=2,
+                    pdf_completed_callback=on_completed,
+                )
+
+            self.assertCountEqual(callbacks, ["first.pdf", "second.pdf"])
+            self.assertEqual(
+                [item.path for item in summary.files],
+                ["bid_announcement\\first.pdf", "bid_announcement\\second.pdf"],
+            )
 
 
 if __name__ == "__main__":
