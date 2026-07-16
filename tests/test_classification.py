@@ -13,7 +13,7 @@ from pypdf import PdfWriter
 
 from bidding_ocr.pipeline import classify_pdf_for_plan, discover_pdf_files
 from bidding_ocr.utils import classify_pdf, is_tender_cover_text
-from main import build_argument_parser, parse_category_list
+from main import build_argument_parser, default_worker_count, parse_category_list
 
 
 def write_blank_pdf(path: Path, page_count: int) -> None:
@@ -171,6 +171,19 @@ class DiscoveryAndCLITests(unittest.TestCase):
         """
         with self.assertRaises(argparse.ArgumentTypeError):
             parse_category_list("award_notice,not_exists")
+
+    def test_workers_argument_uses_safe_default_and_rejects_zero(self) -> None:
+        """
+        【方法功能】验证 worker 默认值限制在安全范围且拒绝非正数。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 16:00:00
+        """
+        parser = build_argument_parser()
+        self.assertEqual(parser.parse_args([]).workers, default_worker_count())
+        self.assertEqual(parser.parse_args(["--workers", "1"]).workers, 1)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--workers", "0"])
 
 
 if __name__ == "__main__":

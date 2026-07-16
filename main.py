@@ -3,10 +3,41 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from bidding_ocr import ProcessingConfig, process_pdf_tree
 from bidding_ocr.models import CATEGORIES
+
+
+def default_worker_count() -> int:
+    """
+    【函数功能】计算适合 OCR 批处理的默认进程数，避免一次占满全部 CPU。
+    :return: int+不超过4且至少保留一个 CPU 的默认进程数
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 16:00:00
+    Example: default_worker_count()
+    """
+    return max(1, min(4, (os.cpu_count() or 2) - 1))
+
+
+def positive_worker_count(value: str) -> int:
+    """
+    【函数功能】解析并校验多进程 worker 数量。
+    :param value: str+命令行传入的进程数
+    :return: int+大于等于1的进程数
+    :raises argparse.ArgumentTypeError: 数值不是正整数时触发
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 16:00:00
+    Example: positive_worker_count("4")
+    """
+    try:
+        workers = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("workers 必须是整数") from exc
+    if workers < 1:
+        raise argparse.ArgumentTypeError("workers 必须大于等于1")
+    return workers
 
 
 def parse_category_list(value: str) -> tuple[str, ...]:
@@ -52,6 +83,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ocr-threshold", type=float, default=0.80, help="OCR 复核阈值，默认：0.80")
     parser.add_argument("--force", action="store_true", help="忽略 OCR 缓存并重新识别")
+    parser.add_argument(
+        "--workers",
+        type=positive_worker_count,
+        default=default_worker_count(),
+        help="PDF 并行进程数，默认不超过4且保留一个 CPU；传1表示串行",
+    )
     category_group = parser.add_mutually_exclusive_group()
     category_group.add_argument(
         "--category",
@@ -96,6 +133,7 @@ def main() -> int:
         progress_callback=lambda message: print(message, flush=True),
         include_categories=args.include,
         exclude_categories=args.exclude,
+        workers=args.workers,
     )
     print(
         f"处理完成：扫描 {summary.scanned_files} 个，识别 {summary.recognized_files} 个，"

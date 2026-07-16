@@ -203,6 +203,26 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(len(FakePDFTextEngine.received_ocr_backends), 1)
             self.assertIsInstance(FakePDFTextEngine.received_ocr_backends[0], RapidOCRBackend)
 
+    def test_parallel_workers_reject_injected_backend(self) -> None:
+        """
+        【方法功能】验证多进程模式拒绝不可跨进程序列化的外部 OCR backend。
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 16:00:00
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "pdf_files" / "bid_announcement"
+            input_dir.mkdir(parents=True)
+            (input_dir / "announcement.pdf").write_bytes(b"fake-pdf")
+            with self.assertRaisesRegex(ValueError, "ocr_backend"):
+                process_pdf_tree(
+                    root / "pdf_files",
+                    root / "results",
+                    ocr_backend=object(),
+                    workers=2,
+                )
+
     def test_include_filter_skips_unknown_files_and_expands_summary(self) -> None:
         """
         【方法功能】验证包含筛选仅处理目标类别，未知文件跳过且摘要记录扫描分类统计。

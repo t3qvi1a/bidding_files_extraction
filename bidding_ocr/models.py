@@ -244,6 +244,8 @@ class ProcessSummary:
         category_file_counts: dict[str, int]+分类成功文件的类别计数
         classification_errors: list[dict[str, str]]+分类预检错误明细
         selected_categories: list[str]+本次筛选后允许处理的标准类别
+        worker_count: int+本次实际使用的进程数
+        parallel: bool+是否启用多进程处理
     :Author: gexinyan
     :CreateTime: 2026-07-13 11:08:59
     """
@@ -261,6 +263,8 @@ class ProcessSummary:
     category_file_counts: dict[str, int] = field(default_factory=dict)
     classification_errors: list[dict[str, str]] = field(default_factory=list)
     selected_categories: list[str] = field(default_factory=list)
+    worker_count: int = 1
+    parallel: bool = False
 
     @property
     def total_files(self) -> int:
@@ -321,6 +325,8 @@ class ProcessSummary:
             "分类预检失败文件数": self.classification_failed_files,
             "各类别识别文件数": self.category_file_counts,
             "本次处理类别": self.selected_categories,
+            "并行进程数": self.worker_count,
+            "并行模式": self.parallel,
             "文件总数": self.total_files,
             "记录总数": self.total_records,
             "待复核记录数": self.review_records,

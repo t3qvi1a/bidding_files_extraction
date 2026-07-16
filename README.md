@@ -40,6 +40,19 @@ python main.py --input pdf_files --output results --include "award_notice,bid_ca
 python main.py --input pdf_files --output results --exclude "archive_info,tender_cover"
 ```
 
+多进程处理时，每个进程独立处理一个 PDF。默认 worker 数量为 `min(4, CPU核数-1)`；传入 `--workers 1` 可恢复串行模式：
+
+```bash
+python main.py --input pdf_files --output results --include "bid_candidates" --workers 4
+```
+
+Linux 服务器可使用 `tmux` 保持后台运行：
+
+```bash
+tmux new-session -d -s bidding-ocr \
+  "LANG=C.UTF-8 python -u main.py --input /data/bidding_files --output /data/output/test_mp --workers 4 > /data/logs/ocr.log 2>&1"
+```
+
 `--include` 和 `--exclude` 不能同时使用。类别名称必须来自：`tender_cover`、`bid_evaluation_report`、`bid_candidates`、`award_notice`、`bid_announcement`、`bid_list`、`archive_info`。旧参数 `--category` 继续保留，用于兼容只处理一个类别的调用，并且同样不能与前两个参数同时使用。
 
 常用参数：
@@ -51,6 +64,7 @@ python main.py --input pdf_files --output results --exclude "archive_info,tender
 --force                   忽略 OCR JSON 缓存并重新识别
 --include 类别1,类别2     仅处理列出的类别
 --exclude 类别1,类别2     不处理列出的类别
+--workers N                并行进程数，默认不超过4且保留一个 CPU；1表示串行
 ```
 
 ## 自动分类规则

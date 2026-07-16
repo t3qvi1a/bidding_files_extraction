@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from abc import ABC, abstractmethod
@@ -672,4 +673,9 @@ class PDFTextEngine:
                 for line in page.lines
             ],
         }
-        cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, cache_path)

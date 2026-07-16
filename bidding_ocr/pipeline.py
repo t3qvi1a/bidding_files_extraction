@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import csv
 import json
+import multiprocessing
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime
@@ -55,6 +57,40 @@ SOURCE_PRIORITY = {
 }
 
 ProgressCallback = Callable[[str], None]
+_WORKER_OCR_BACKEND: OCRBackend | None = None
+
+
+def _initialize_pdf_worker() -> None:
+    """
+    【函数功能】在每个子进程中独立创建 RapidOCR 后端，避免跨进程共享模型实例。
+    :return: None
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 16:00:00
+    """
+    global _WORKER_OCR_BACKEND
+    _WORKER_OCR_BACKEND = RapidOCRBackend()
+
+
+def _process_pdf_worker(
+    task: tuple[Path, Path, Path, ProcessingConfig, str],
+) -> tuple[ParsedDocument, list[str]]:
+    """
+    【函数功能】在独立进程中处理一个预分类 PDF，并返回可序列化结果。
+    :param task: tuple+PDF 路径、输入根目录、缓存目录、配置和预分类类别
+    :return: tuple[ParsedDocument, list[str]]+单文件解析结果与告警
+    :raises Exception: 单文件解析失败时透传给主进程
+    :Author: gexinyan
+    :CreateTime: 2026-07-15 16:00:00
+    """
+    pdf_path, input_root, cache_dir, config, planned_category = task
+    return process_single_pdf(
+        pdf_path,
+        input_root,
+        cache_dir,
+        config,
+        ocr_backend=_WORKER_OCR_BACKEND,
+        planned_category=planned_category,
+    )
 
 
 def _windows_extended_path(path: Path) -> Path:
@@ -208,6 +244,7 @@ def process_pdf_tree(
     ocr_backend: OCRBackend | None = None,
     include_categories: Iterable[str] | None = None,
     exclude_categories: Iterable[str] | None = None,
+    workers: int = 1,
 ) -> ProcessSummary:
     """
     【函数功能】统一处理输入目录中的全部 PDF，输出分类、合并及复核结果。
@@ -219,6 +256,7 @@ def process_pdf_tree(
     :param ocr_backend: OCRBackend|None+可选共享 OCR 后端（默认本次运行创建一个 RapidOCR 后端）
     :param include_categories: Iterable[str]|None+可选包含类别集合，仅处理这些类别
     :param exclude_categories: Iterable[str]|None+可选排除类别集合，不处理这些类别
+    :param workers: int+并行处理进程数，1表示串行（默认1）
     :return: ProcessSummary+本次运行统计
     :raises FileNotFoundError: 输入目录不存在时触发
     :Author: gexinyan
@@ -236,7 +274,11 @@ def process_pdf_tree(
     )
     selected_category_set = set(selected_categories)
     actual_config = config or ProcessingConfig()
-    shared_ocr_backend = ocr_backend or RapidOCRBackend()
+    if workers < 1:
+        raise ValueError("workers 必须为大于等于1的整数")
+    if workers > 1 and ocr_backend is not None:
+        raise ValueError("workers 大于1时不能传入可共享的 ocr_backend")
+    shared_ocr_backend = ocr_backend or RapidOCRBackend() if workers == 1 else None
     output_path.mkdir(parents=True, exist_ok=True)
     cache_dir = output_path / ".ocr_cache"
     started_at = current_timestamp()
@@ -277,10 +319,6 @@ def process_pdf_tree(
         for pdf_path in recognized_paths
         if planned_categories[pdf_path] in selected_category_set
     ]
-    category_totals: dict[str, int] = defaultdict(int)
-    for pdf_path in pdf_paths:
-        category_totals[planned_categories[pdf_path]] += 1
-    category_positions: dict[str, int] = defaultdict(int)
     total_files = len(pdf_paths)
     _emit_progress(
         progress_callback,
@@ -291,36 +329,28 @@ def process_pdf_tree(
         ),
     )
 
-    for file_index, pdf_path in enumerate(pdf_paths, start=1):
+    def consume_result(
+        file_index: int,
+        pdf_path: Path,
+        result: tuple[ParsedDocument, list[str]] | None,
+        error: Exception | None = None,
+    ) -> None:
+        """
+        【函数功能】在主进程中统一收集单文件结果并生成运行摘要条目。
+        :param file_index: int+按输入路径排序的文件序号
+        :param pdf_path: Path+已处理 PDF 路径
+        :param result: tuple|None+成功解析结果
+        :param error: Exception|None+失败异常
+        :return: None
+        :Author: gexinyan
+        :CreateTime: 2026-07-15 16:00:00
+        """
         relative_path = str(pdf_path.relative_to(scan_input_path))
         planned_category = planned_categories[pdf_path]
-        category_positions[planned_category] += 1
-        category_index = category_positions[planned_category]
-        category_total = category_totals[planned_category]
-        _emit_progress(
-            progress_callback,
-            (
-                f"{_format_progress_bar(file_index - 1, total_files)} "
-                f"处理中 {file_index}/{total_files} | 类别 {planned_category} "
-                f"{category_index}/{category_total} | 文件：{relative_path}"
-            ),
-        )
-        try:
-            document, warnings = process_single_pdf(
-                pdf_path,
-                scan_input_path,
-                cache_dir,
-                actual_config,
-                ocr_backend=shared_ocr_backend,
-                progress_callback=lambda message: _emit_progress(
-                    progress_callback,
-                    f"文件：{relative_path} | {message}",
-                ),
-                planned_category=planned_category,
-            )
+        if error is None and result is not None:
+            document, warnings = result
             all_records.extend(document.records)
             review_count = sum(record.review_status != "通过" for record in document.records)
-            status = "待复核" if review_count or warnings else "成功"
             file_summary = FileProcessSummary(
                 path=relative_path,
                 category=document.category,
@@ -328,28 +358,29 @@ def process_pdf_tree(
                 ocr_pages=sorted(document.ocr_pages),
                 records=len(document.records),
                 review_records=review_count,
-                status=status,
+                status="待复核" if review_count or warnings else "成功",
                 error="；".join(warnings),
             )
-            file_summaries.append(file_summary)
             _emit_progress(
                 progress_callback,
                 (
-                    f"{_format_progress_bar(file_index, total_files)} "
-                    f"完成 {file_index}/{total_files} | 类别 {file_summary.category} "
+                    f"{_format_progress_bar(file_index, total_files)} 完成 "
+                    f"{file_index}/{total_files} | 类别 {file_summary.category} "
                     f"| 页数 {file_summary.pages} | OCR 页 {file_summary.ocr_pages or '无'} "
                     f"| 记录 {file_summary.records} | 状态 {file_summary.status}"
                 ),
             )
-        except Exception as exc:
-            failed_record = ExtractionRecord(
-                category="unknown",
-                source_path=relative_path,
-                evidence=f"文件解析失败：{exc}",
-                review_status="待复核",
-                generated_at=current_timestamp(),
+        else:
+            message = str(error or "未知错误")
+            all_records.append(
+                ExtractionRecord(
+                    category="unknown",
+                    source_path=relative_path,
+                    evidence=f"文件解析失败：{message}",
+                    review_status="待复核",
+                    generated_at=current_timestamp(),
+                )
             )
-            all_records.append(failed_record)
             file_summary = FileProcessSummary(
                 path=relative_path,
                 category="unknown",
@@ -358,17 +389,84 @@ def process_pdf_tree(
                 records=1,
                 review_records=1,
                 status="失败",
-                error=str(exc),
+                error=message,
             )
-            file_summaries.append(file_summary)
             _emit_progress(
                 progress_callback,
                 (
-                    f"{_format_progress_bar(file_index, total_files)} "
-                    f"完成 {file_index}/{total_files} | 类别 {planned_category} "
-                    f"| 文件解析失败：{relative_path} | 原因：{exc}"
+                    f"{_format_progress_bar(file_index, total_files)} 完成 "
+                    f"{file_index}/{total_files} | 类别 {planned_category} "
+                    f"| 文件解析失败：{relative_path} | 原因：{message}"
                 ),
             )
+        file_summaries.append(file_summary)
+
+    if workers == 1:
+        for file_index, pdf_path in enumerate(pdf_paths, start=1):
+            relative_path = str(pdf_path.relative_to(scan_input_path))
+            planned_category = planned_categories[pdf_path]
+            _emit_progress(
+                progress_callback,
+                (
+                    f"{_format_progress_bar(file_index - 1, total_files)} 处理中 "
+                    f"{file_index}/{total_files} | 类别 {planned_category} "
+                    f"| 文件：{relative_path}"
+                ),
+            )
+            try:
+                result = process_single_pdf(
+                    pdf_path,
+                    scan_input_path,
+                    cache_dir,
+                    actual_config,
+                    ocr_backend=shared_ocr_backend,
+                    progress_callback=lambda message, path=relative_path: _emit_progress(
+                        progress_callback,
+                        f"文件：{path} | {message}",
+                    ),
+                    planned_category=planned_category,
+                )
+                consume_result(file_index, pdf_path, result)
+            except Exception as exc:
+                consume_result(file_index, pdf_path, None, exc)
+    else:
+        context = multiprocessing.get_context("spawn")
+        tasks = [
+            (
+                pdf_path,
+                scan_input_path,
+                cache_dir,
+                actual_config,
+                planned_categories[pdf_path],
+            )
+            for pdf_path in pdf_paths
+        ]
+        indexed_results: dict[
+            int,
+            tuple[tuple[ParsedDocument, list[str]] | None, Exception | None],
+        ] = {}
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=context,
+            initializer=_initialize_pdf_worker,
+        ) as executor:
+            future_indexes = {
+                executor.submit(_process_pdf_worker, task): index
+                for index, task in enumerate(tasks, start=1)
+            }
+            for future in as_completed(future_indexes):
+                index = future_indexes[future]
+                try:
+                    indexed_results[index] = (future.result(), None)
+                except Exception as exc:
+                    indexed_results[index] = (None, exc)
+                _emit_progress(
+                    progress_callback,
+                    f"并行处理完成 {len(indexed_results)}/{total_files} 个 PDF。",
+                )
+        for index, pdf_path in enumerate(pdf_paths, start=1):
+            result, error = indexed_results[index]
+            consume_result(index, pdf_path, result, error)
 
     _emit_progress(progress_callback, "PDF 解析完成，正在生成分类 CSV、最终汇总和复核清单。")
     _write_category_csv_files(all_records, output_path)
@@ -391,6 +489,8 @@ def process_pdf_tree(
         category_file_counts=recognized_category_counts,
         classification_errors=classification_errors,
         selected_categories=list(selected_categories),
+        worker_count=workers,
+        parallel=workers > 1,
     )
     (output_path / "run_summary.json").write_text(
         json.dumps(summary.to_dict(), ensure_ascii=False, indent=2),
