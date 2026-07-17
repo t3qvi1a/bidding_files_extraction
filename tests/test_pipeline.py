@@ -384,6 +384,7 @@ class PipelineIntegrationTests(unittest.TestCase):
             first_path.write_bytes(b"fake-pdf")
             second_path.write_bytes(b"fake-pdf")
             callbacks: list[str] = []
+            messages: list[str] = []
 
             def build_worker_result(task: tuple[Path, Path, Path, ProcessingConfig, str]) -> tuple[ParsedDocument, list[str]]:
                 """
@@ -425,9 +426,13 @@ class PipelineIntegrationTests(unittest.TestCase):
                     root / "results",
                     workers=2,
                     pdf_completed_callback=on_completed,
+                    progress_callback=messages.append,
                 )
 
             self.assertCountEqual(callbacks, ["first.pdf", "second.pdf"])
+            self.assertFalse(any("并行处理完成" in message for message in messages))
+            self.assertTrue(any("完成 1/2" in message for message in messages))
+            self.assertTrue(any("完成 2/2" in message for message in messages))
             self.assertEqual(
                 [item.path for item in summary.files],
                 ["bid_announcement\\first.pdf", "bid_announcement\\second.pdf"],

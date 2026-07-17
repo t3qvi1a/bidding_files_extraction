@@ -285,8 +285,8 @@ def process_pdf_tree(
     output_path.mkdir(parents=True, exist_ok=True)
     cache_dir = output_path / ".ocr_cache"
     started_at = current_timestamp()
-    all_records: list[ExtractionRecord] = []
-    file_summaries: list[FileProcessSummary] = []
+    indexed_records: dict[int, list[ExtractionRecord]] = {}
+    indexed_file_summaries: dict[int, FileProcessSummary] = {}
     scan_input_path, all_pdf_paths = discover_pdf_files(input_path)
     planned_categories: dict[Path, str] = {}
     classification_errors: list[dict[str, str]] = []
@@ -337,6 +337,7 @@ def process_pdf_tree(
         pdf_path: Path,
         result: tuple[ParsedDocument, list[str]] | None,
         error: Exception | None = None,
+        progress_index: int | None = None,
     ) -> None:
         """
         【函数功能】在主进程中统一收集单文件结果并生成运行摘要条目。
@@ -344,15 +345,17 @@ def process_pdf_tree(
         :param pdf_path: Path+已处理 PDF 路径
         :param result: tuple|None+成功解析结果
         :param error: Exception|None+失败异常
+        :param progress_index: int|None+完成序号，未指定时使用文件排序序号
         :return: None
         :Author: gexinyan
         :CreateTime: 2026-07-15 16:00:00
         """
         relative_path = str(pdf_path.relative_to(scan_input_path))
         planned_category = planned_categories[pdf_path]
+        displayed_index = progress_index if progress_index is not None else file_index
         if error is None and result is not None:
             document, warnings = result
-            all_records.extend(document.records)
+            indexed_records[file_index] = document.records
             review_count = sum(record.review_status != "通过" for record in document.records)
             file_summary = FileProcessSummary(
                 path=relative_path,
@@ -367,15 +370,15 @@ def process_pdf_tree(
             _emit_progress(
                 progress_callback,
                 (
-                    f"{_format_progress_bar(file_index, total_files)} 完成 "
-                    f"{file_index}/{total_files} | 类别 {file_summary.category} "
+                    f"{_format_progress_bar(displayed_index, total_files)} 完成 "
+                    f"{displayed_index}/{total_files} | 类别 {file_summary.category} "
                     f"| 页数 {file_summary.pages} | OCR 页 {file_summary.ocr_pages or '无'} "
                     f"| 记录 {file_summary.records} | 状态 {file_summary.status}"
                 ),
             )
         else:
             message = str(error or "未知错误")
-            all_records.append(
+            indexed_records[file_index] = [
                 ExtractionRecord(
                     category="unknown",
                     source_path=relative_path,
@@ -383,7 +386,7 @@ def process_pdf_tree(
                     review_status="待复核",
                     generated_at=current_timestamp(),
                 )
-            )
+            ]
             file_summary = FileProcessSummary(
                 path=relative_path,
                 category="unknown",
@@ -397,12 +400,12 @@ def process_pdf_tree(
             _emit_progress(
                 progress_callback,
                 (
-                    f"{_format_progress_bar(file_index, total_files)} 完成 "
-                    f"{file_index}/{total_files} | 类别 {planned_category} "
+                    f"{_format_progress_bar(displayed_index, total_files)} 完成 "
+                    f"{displayed_index}/{total_files} | 类别 {planned_category} "
                     f"| 文件解析失败：{relative_path} | 原因：{message}"
                 ),
             )
-        file_summaries.append(file_summary)
+        indexed_file_summaries[file_index] = file_summary
 
     if workers == 1:
         for file_index, pdf_path in enumerate(pdf_paths, start=1):
@@ -451,10 +454,6 @@ def process_pdf_tree(
             )
             for pdf_path in pdf_paths
         ]
-        indexed_results: dict[
-            int,
-            tuple[tuple[ParsedDocument, list[str]] | None, Exception | None],
-        ] = {}
         with ProcessPoolExecutor(
             max_workers=workers,
             mp_context=context,
@@ -464,8 +463,10 @@ def process_pdf_tree(
                 executor.submit(_process_pdf_worker, task): index
                 for index, task in enumerate(tasks, start=1)
             }
+            completed_files = 0
             for future in as_completed(future_indexes):
                 index = future_indexes[future]
+                completed_files += 1
                 try:
                     result = future.result()
                     document, warnings = result
@@ -475,16 +476,30 @@ def process_pdf_tree(
                         warnings,
                         progress_callback,
                     )
-                    indexed_results[index] = (result, None)
+                    consume_result(
+                        index,
+                        pdf_paths[index - 1],
+                        result,
+                        progress_index=completed_files,
+                    )
                 except Exception as exc:
-                    indexed_results[index] = (None, exc)
-                _emit_progress(
-                    progress_callback,
-                    f"并行处理完成 {len(indexed_results)}/{total_files} 个 PDF。",
-                )
-        for index, pdf_path in enumerate(pdf_paths, start=1):
-            result, error = indexed_results[index]
-            consume_result(index, pdf_path, result, error)
+                    consume_result(
+                        index,
+                        pdf_paths[index - 1],
+                        None,
+                        exc,
+                        progress_index=completed_files,
+                    )
+
+    all_records = [
+        record
+        for file_index in range(1, total_files + 1)
+        for record in indexed_records.get(file_index, [])
+    ]
+    file_summaries = [
+        indexed_file_summaries[file_index]
+        for file_index in range(1, total_files + 1)
+    ]
 
     _emit_progress(progress_callback, "PDF 解析完成，正在生成分类 CSV、最终汇总和复核清单。")
     _write_category_csv_files(all_records, output_path)
