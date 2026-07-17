@@ -11,7 +11,7 @@ from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from pypdf import PdfReader
 
@@ -58,6 +58,7 @@ SOURCE_PRIORITY = {
 
 ProgressCallback = Callable[[str], None]
 PdfCompletedCallback = Callable[[ParsedDocument, list[str]], None]
+PdfProgressCallback = Callable[[dict[str, Any]], None]
 _WORKER_OCR_BACKEND: OCRBackend | None = None
 
 
@@ -247,6 +248,7 @@ def process_pdf_tree(
     exclude_categories: Iterable[str] | None = None,
     workers: int = 1,
     pdf_completed_callback: PdfCompletedCallback | None = None,
+    pdf_progress_callback: PdfProgressCallback | None = None,
 ) -> ProcessSummary:
     """
     【函数功能】统一处理输入目录中的全部 PDF，输出分类、合并及复核结果。
@@ -260,6 +262,7 @@ def process_pdf_tree(
     :param exclude_categories: Iterable[str]|None+可选排除类别集合，不处理这些类别
     :param workers: int+并行处理进程数，1表示串行（默认1）
     :param pdf_completed_callback: PdfCompletedCallback|None+单个 PDF 解析成功后在主进程执行的回调；回调异常仅记录为告警，不中断 OCR
+    :param pdf_progress_callback: PdfProgressCallback|None+单个 PDF 成功或失败后在主进程发送结构化进度
     :return: ProcessSummary+本次运行统计
     :raises FileNotFoundError: 输入目录不存在时触发
     :Author: gexinyan
@@ -331,6 +334,7 @@ def process_pdf_tree(
             f"筛选后待处理 {total_files} 个；类别：{', '.join(selected_categories) or '无'}。"
         ),
     )
+    _emit_pdf_progress(pdf_progress_callback, 0, total_files)
 
     def consume_result(
         file_index: int,
@@ -406,6 +410,7 @@ def process_pdf_tree(
                 ),
             )
         indexed_file_summaries[file_index] = file_summary
+        _emit_pdf_progress(pdf_progress_callback, displayed_index, total_files)
 
     if workers == 1:
         for file_index, pdf_path in enumerate(pdf_paths, start=1):
@@ -558,6 +563,35 @@ def _notify_pdf_completed(
         message = f"单 PDF 完成回调失败：{document.pdf_path}，原因：{exc}"
         warnings.append(message)
         _emit_progress(progress_callback, message)
+
+
+def _emit_pdf_progress(
+    callback: PdfProgressCallback | None,
+    completed: int,
+    total: int,
+) -> None:
+    """
+    【函数功能】向外部调用方发送不依赖日志文本的 PDF 解析进度快照。
+    :param callback: PdfProgressCallback|None，结构化进度接收函数
+    :param completed: int，已完成处理的 PDF 数量
+    :param total: int，本次待处理 PDF 总数量
+    :return: None
+    :Author: gexinyan
+    :CreateTime: 2026-07-17 10:30:00
+    Example: _emit_pdf_progress(callback, 3, 10)
+    """
+    if callback is None:
+        return
+    safe_total = max(0, total)
+    safe_completed = min(max(0, completed), safe_total)
+    percent = int(safe_completed * 100 / safe_total) if safe_total else 0
+    callback(
+        {
+            "completed": safe_completed,
+            "total": safe_total,
+            "percent": percent,
+        }
+    )
 
 
 def _emit_progress(callback: ProgressCallback | None, message: str) -> None:

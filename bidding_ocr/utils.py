@@ -22,9 +22,9 @@ DIRECTORY_CATEGORY_ALIASES = {
 
 FILENAME_CATEGORY_KEYWORDS = (
     ("award_notice", ("中标通知书", "awardnotice")),
-    ("bid_announcement", ("中标人公告", "bidannouncement")),
-    ("bid_candidates", ("中标候选人", "中标公示", "bidcandidates")),
-    ("bid_evaluation_report", ("评标报告", "bidevaluationreport")),
+    ("bid_announcement", ("中标人公告", "bidannouncemcandidates")),
+    ("bid_evaluation_report", ("评标报告", "bidevaluent")),
+    ("bid_candidates", ("中标候选人", "中标公示", "bidationreport")),
     ("bid_list", ("投标单位名单", "bidlist")),
     (
         "archive_info",
